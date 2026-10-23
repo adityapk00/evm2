@@ -100,8 +100,7 @@ pub struct TracingInspector {
     ///
     /// This is a stack because nested calls are executed between the `step` and `step_end` of the
     /// call instruction itself. A `usize::MAX` step index marks a step that was not recorded.
-    /// The optional cost captures call gas before the child returns its unused gas.
-    step_stack: Vec<(usize, usize, Option<u64>)>,
+    step_stack: Vec<(usize, usize)>,
     /// Number of opcode steps captured across all calls since the last reset.
     recorded_steps: u64,
     /// Tracks the journal len in the step, used in step_end to check if the journal has changed
@@ -471,7 +470,7 @@ impl TracingInspector {
             && self.config.step_limit.is_none_or(|limit| self.recorded_steps < limit.get());
         if !record {
             // Push a sentinel so that the upcoming `step_end` stays paired with this step.
-            self.step_stack.push((trace_idx, usize::MAX, None));
+            self.step_stack.push((trace_idx, usize::MAX));
             return;
         }
 
@@ -543,7 +542,8 @@ impl TracingInspector {
             gas_used,
             immediate_bytes,
 
-            // These fields will be populated in `step_end`.
+            // These fields will be populated in `step_end`, except call costs captured before
+            // child execution.
             push_stack: None,
             gas_cost: 0,
             state_gas_cost: None,
@@ -560,7 +560,7 @@ impl TracingInspector {
         });
 
         node.ordering.push(TraceMemberOrder::Step(step_idx));
-        self.step_stack.push((trace_idx, step_idx, None));
+        self.step_stack.push((trace_idx, step_idx));
 
         if self.config.record_step_deltas {
             let write_range = memory_write_range(op.get(), interp.stack().as_slice());
@@ -584,7 +584,7 @@ impl TracingInspector {
     /// Invoked on [Inspector::step_end].
     #[cold]
     fn fill_step_on_step_end<T: EvmTypes>(&mut self, interp: &mut Interpreter<'_, '_, T>) {
-        let Some((trace_idx, step_idx, call_gas_cost)) = self.step_stack.pop() else {
+        let Some((trace_idx, step_idx)) = self.step_stack.pop() else {
             return;
         };
         let node = &mut self.traces.arena[trace_idx];
@@ -596,7 +596,7 @@ impl TracingInspector {
         // See comments in `start_step`.
         debug_assert!(
             step.push_stack.is_none()
-                && step.gas_cost == 0
+                && (step.gas_cost == 0 || step.is_call_like_op())
                 && step.storage_change.is_none()
                 && step.status.is_none()
                 && step.decoded.is_none(),
@@ -652,13 +652,13 @@ impl TracingInspector {
             };
         }
 
-        // The gas cost is the difference between the recorded gas remaining at the start of the
-        // step the remaining gas here, at the end of the step.
-        // TODO: Figure out why this can overflow. https://github.com/paradigmxyz/revm-inspectors/pull/38
-        step.gas_cost = interp
-            .failed_charge()
-            .or(call_gas_cost)
-            .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        // Call costs are captured before child execution returns unused gas. A zero cost
+        // also covers calls that failed before reaching their hook.
+        if step.gas_cost == 0 {
+            step.gas_cost = interp
+                .failed_charge()
+                .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        }
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
@@ -730,12 +730,12 @@ impl TracingInspector {
     }
 
     fn record_call_gas_cost<T: EvmTypes>(&mut self, interp: &Interpreter<'_, '_, T>) {
-        if let Some((trace_idx, step_idx, cost)) = self.step_stack.last_mut()
-            && let Some(step) = self.traces.arena[*trace_idx].trace.steps.get(*step_idx)
+        if let Some((trace_idx, step_idx)) = self.step_stack.last()
+            && let Some(step) = self.traces.arena[*trace_idx].trace.steps.get_mut(*step_idx)
         {
             // `step_end` runs after child execution. Parity's cost includes forwarded gas,
             // whereas its execution record reports the parent's gas after the child returns.
-            *cost = Some(step.gas_remaining.saturating_sub(interp.gas().remaining()));
+            step.gas_cost = step.gas_remaining.saturating_sub(interp.gas().remaining());
         }
     }
 }

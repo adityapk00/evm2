@@ -1201,3 +1201,18 @@ fn vmtrace_create_cost_includes_forwarded_gas() {
         assert_eq!(trace.ops[index].ex.as_ref().unwrap().used, available);
     }
 }
+
+#[test]
+fn vmtrace_nested_calls_preserve_each_forwarded_cost() {
+    let trace = trace_vm_code(&hex!("5f5f5f5f5f604361fffff100"), &hex!("5f5f5f5f5f60046103e8f100"));
+    let outer = &trace.ops[7];
+    let child = outer.sub.as_ref().unwrap();
+    let inner = &child.ops[7];
+    assert_eq!(outer.cost, 2_600 + 65_535);
+    assert_eq!(inner.cost, 100 + 1_000);
+    assert_eq!(
+        outer.ex.as_ref().unwrap().used,
+        trace.ops[6].ex.as_ref().unwrap().used - 2_600 - 16 - 100 - 15
+    );
+    assert_eq!(inner.ex.as_ref().unwrap().used, child.ops[6].ex.as_ref().unwrap().used - 100 - 15);
+}
