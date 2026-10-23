@@ -202,7 +202,7 @@ impl<ExtDB> CacheDB<ExtDB> {
         if let Some(code) = &info.code
             && !code.is_empty()
         {
-            if info.code_hash == KECCAK256_EMPTY {
+            if info.is_empty_code_hash() {
                 info.code_hash = code.hash_slow();
             }
             contracts.entry(info.code_hash).or_insert_with(|| code.clone());
@@ -351,8 +351,8 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
 
     #[inline]
     fn get_storage(&mut self, address: &Address, key: &Word) -> DbResult<Word> {
-        // Serve the slot from the attached read BAL when it covers a write at or before the current
-        // index; otherwise fall through to the cache/database.
+        // Serve the slot from the attached read BAL when it covers a write strictly before the
+        // current index; otherwise fall through to the cache/database.
         match self.bal_context.bal_storage(address, key) {
             Ok(Some(value)) => return Ok(value),
             Ok(None) => {}
