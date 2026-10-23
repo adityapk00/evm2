@@ -792,7 +792,9 @@ fn vmtrace_terminal_call_finalizes_delta_at_capture_limit() {
         let mem = ex.mem.as_ref().unwrap();
         assert_eq!(mem.off, 32);
         assert_eq!(mem.data.as_ref(), &[42]);
-        assert_eq!(ex.used, trace.ops[6].ex.as_ref().unwrap().used - call.cost);
+        // The child spends 16 gas; its unused forwarded gas returns to the parent.
+        assert_eq!(call.cost, 2_600 + 6 + 65_535);
+        assert_eq!(ex.used, trace.ops[6].ex.as_ref().unwrap().used - call.cost + 65_535 - 16);
     }
 }
 
@@ -1145,3 +1147,57 @@ mod state_diff_birth;
 
 #[path = "parity/state_diff_selfdestruct.rs"]
 mod state_diff_selfdestruct;
+
+#[test]
+fn vmtrace_call_cost_includes_forwarded_gas() {
+    for (prefix, opcode) in
+        [("5f5f5f5f5f", "f1"), ("5f5f5f5f5f", "f2"), ("5f5f5f5f", "f4"), ("5f5f5f5f", "fa")]
+    {
+        for child in [&hex!("00")[..], &hex!("5f5ffd")[..], &[][..]] {
+            let code =
+                alloy_primitives::hex::decode(format!("{prefix}604361ffff{opcode}00")).unwrap();
+            let trace = inspect_code(
+                &code,
+                child,
+                SpecId::PRAGUE,
+                TracingInspectorConfig::parity_vm_trace(),
+            )
+            .into_parity_builder()
+            .vm_trace();
+            let index = trace.ops.len() - 2;
+            let call = &trace.ops[index];
+            assert_eq!(call.cost, 2_600 + 65_535);
+            let before = trace.ops[index - 1].ex.as_ref().unwrap().used;
+            let spent = if child == hex!("5f5ffd") { 4 } else { 0 };
+            assert_eq!(call.ex.as_ref().unwrap().used, before - 2_600 - spent);
+        }
+    }
+}
+
+#[test]
+fn vmtrace_precompile_cost_includes_forwarded_gas() {
+    let code = hex!("5f5f5f5f5f600461fffff100");
+    let trace = inspect_code(&code, &[], SpecId::PRAGUE, TracingInspectorConfig::parity_vm_trace())
+        .into_parity_builder()
+        .vm_trace();
+    assert_eq!(trace.ops[7].cost, 100 + 65_535);
+    assert_eq!(
+        trace.ops[7].ex.as_ref().unwrap().used,
+        trace.ops[6].ex.as_ref().unwrap().used - 100 - 15
+    );
+}
+
+#[test]
+fn vmtrace_create_cost_includes_forwarded_gas() {
+    for code in [&hex!("5f5f5ff000")[..], &hex!("5f5f5f5ff500")[..]] {
+        let trace =
+            inspect_code(code, &[], SpecId::PRAGUE, TracingInspectorConfig::parity_vm_trace())
+                .into_parity_builder()
+                .vm_trace();
+        let index = trace.ops.len() - 2;
+        let before = trace.ops[index - 1].ex.as_ref().unwrap().used;
+        let available = before - 32_000;
+        assert_eq!(trace.ops[index].cost, 32_000 + available - available / 64);
+        assert_eq!(trace.ops[index].ex.as_ref().unwrap().used, available);
+    }
+}
