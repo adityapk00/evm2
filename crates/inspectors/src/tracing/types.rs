@@ -669,7 +669,7 @@ pub struct CallTraceStep {
     // Fields filled in `step_end`
     /// Gas cost of step execution
     pub gas_cost: u64,
-    /// Structured-log cost when cold access metering differs from the execution trace cost.
+    /// Structured-log cost when gas metering differs from the execution trace cost.
     pub geth_gas_cost: Option<u64>,
     /// Net state-gas change caused by this step.
     pub state_gas_cost: Option<i64>,

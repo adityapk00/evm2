@@ -693,6 +693,17 @@ impl TracingInspector {
             .or(step.geth_gas_cost);
         if interp.result() != Err(InstrStop::OutOfGas) {
             step.geth_gas_cost = None;
+        } else if interp.version().feature(EvmFeatures::EIP7702)
+            && interp.failed_charge().is_some_and(|cost| {
+                cost > u64::from(interp.version().gas_params.get(GasId::WarmStorageReadCost))
+            })
+            && matches!(step.op.get(), op::CALL | op::CALLCODE | op::DELEGATECALL | op::STATICCALL)
+        {
+            // Geth's EIP-7702 call metering returns no dynamic cost when its intrinsic
+            // charge fails, including after a successful cold load. Keep the attempted
+            // charge for Parity and report only the constant cost in structured logs.
+            step.geth_gas_cost =
+                Some(u64::from(interp.version().gas_params.get(GasId::WarmStorageReadCost)));
         }
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {

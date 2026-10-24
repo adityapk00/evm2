@@ -191,3 +191,185 @@ fn sload_cost_before_the_static_charge() {
         assert_eq!(trace.ops[7].sub.as_ref().unwrap().ops.last().unwrap().cost, 100);
     }
 }
+
+/// Runs a root CALL with a funded sender and an optionally pre-warmed recipient.
+fn inspect_call_charge(
+    available: u64,
+    warm: bool,
+    existing: bool,
+    value: u8,
+    opcode: u8,
+    spec: SpecId,
+    config: TracingInspectorConfig,
+) -> (TracingInspector, ExecutionResult) {
+    let target = Address::with_last_byte(0x42);
+    let recipient = address!("0000000000000000000000000000000000c0ffee");
+    let mut code = Vec::new();
+    if warm {
+        code.extend(hex!("62c0ffee3150")); // BALANCE; POP
+    }
+    code.extend(hex!("600060006000600060"));
+    code.push(value);
+    code.extend(hex!("62c0ffee61ffff"));
+    code.extend([opcode, op::STOP]);
+    let mut db = CacheDB::<EmptyDB>::default();
+    db.insert_account_info(
+        &target,
+        AccountInfo { balance: U256::from(1_000_000), ..Default::default() }
+            .with_code(Bytecode::new_raw(code.into())),
+    );
+    if existing {
+        db.insert_account_info(&recipient, AccountInfo { nonce: 1, ..Default::default() });
+    }
+    let mut evm = Context::mainnet()
+        .modify_cfg_chained(|cfg| cfg.spec = spec)
+        .with_db(db)
+        .build_mainnet_with_inspector(TracingInspector::new(config));
+    let result = evm
+        .inspect_tx(TxEnv {
+            gas_limit: 21_000 + 21 + if warm { 2605 } else { 0 } + available,
+            kind: TransactTo::Call(target),
+            ..Default::default()
+        })
+        .unwrap();
+    (evm.into_inspector(), result.result)
+}
+
+#[test]
+fn call_dynamic_charge_failure_has_separate_structured_cost() {
+    for spec in [SpecId::PRAGUE, SpecId::OSAKA] {
+        for (warm, existing, opcode, available, attempted) in [
+            (false, false, op::CALL, 34_602, 36_600),
+            (false, false, op::CALL, 36_599, 36_600),
+            (true, false, op::CALL, 34_099, 34_100),
+            (false, true, op::CALL, 11_599, 11_599), // Cold-load guard after value charge.
+            (true, true, op::CALL, 9099, 9100),
+            (false, true, op::CALL, 9000, 9100), // Value charge fails before the load.
+            (false, false, op::CALLCODE, 9000, 9100),
+            (true, false, op::CALLCODE, 9099, 9100),
+        ] {
+            let (inspector, result) = inspect_call_charge(
+                available,
+                warm,
+                existing,
+                1,
+                opcode,
+                spec,
+                TracingInspectorConfig::all(),
+            );
+            assert!(matches!(result, ExecutionResult::Halt { reason: InstrStop::OutOfGas, .. }));
+            assert_eq!(result.gas_used(), 21_021 + if warm { 2605 } else { 0 } + available);
+            let step = inspector.traces().nodes()[0].trace.steps.last().unwrap();
+            assert_eq!(step.op.get(), opcode);
+            assert_eq!(step.gas_remaining, available);
+            assert_eq!(step.gas_cost, attempted);
+            assert_eq!(step.geth_gas_cost, Some(100));
+            let geth = inspector.geth_builder().geth_traces(
+                result.gas_used(),
+                Bytes::new(),
+                GethDefaultTracingOptions::default(),
+            );
+            assert_eq!(geth.struct_logs.last().unwrap().gas_cost, 100);
+            let parity = inspector.into_parity_builder().vm_trace();
+            assert_eq!(parity.ops.last().unwrap().cost, attempted);
+            assert!(parity.ops.last().unwrap().ex.is_none());
+        }
+    }
+}
+
+#[test]
+fn call_dynamic_charge_success_and_fork_controls() {
+    for (warm, existing, value, opcode, available, spent) in [
+        (false, false, 1, op::CALL, 36_600, 34_300),
+        (false, false, 1, op::CALL, 36_601, 34_300),
+        (true, false, 1, op::CALL, 34_100, 31_800),
+        (false, true, 1, op::CALL, 11_600, 9300),
+        (true, true, 1, op::CALL, 9100, 6800),
+        (false, false, 1, op::CALLCODE, 11_600, 9300),
+        (true, false, 1, op::CALLCODE, 9100, 6800),
+        (false, false, 0, op::CALL, 2600, 2600),
+        (true, false, 0, op::CALL, 100, 100),
+    ] {
+        let (inspector, result) = inspect_call_charge(
+            available,
+            warm,
+            existing,
+            value,
+            opcode,
+            SpecId::OSAKA,
+            TracingInspectorConfig::all(),
+        );
+        assert!(result.is_success());
+        assert_eq!(result.gas_used(), 21_021 + if warm { 2605 } else { 0 } + spent);
+        assert!(
+            inspector.traces().nodes()[0]
+                .trace
+                .steps
+                .iter()
+                .all(|step| step.geth_gas_cost.is_none())
+        );
+    }
+    // Pre-7702 metering retains the attempted charge in both trace formats.
+    let (inspector, _) = inspect_call_charge(
+        34_602,
+        false,
+        false,
+        1,
+        op::CALL,
+        SpecId::CANCUN,
+        TracingInspectorConfig::all(),
+    );
+    let step = inspector.traces().nodes()[0].trace.steps.last().unwrap();
+    assert_eq!(step.gas_cost, 36_600);
+    assert_eq!(step.geth_gas_cost, None);
+}
+
+#[test]
+fn call_dynamic_charge_override_does_not_require_snapshots() {
+    let options = GethDefaultTracingOptions { disable_stack: Some(true), ..Default::default() };
+    let (inspector, _) = inspect_call_charge(
+        34_602,
+        false,
+        false,
+        1,
+        op::CALL,
+        SpecId::OSAKA,
+        TracingInspectorConfig::from_geth_config(&options),
+    );
+    let step = inspector.traces().nodes()[0].trace.steps.last().unwrap();
+    assert!(step.stack.is_none() && step.memory.is_none());
+    assert_eq!(step.geth_gas_cost, Some(100));
+    let geth = inspector.geth_builder().geth_traces(0, Bytes::new(), options);
+    assert_eq!(geth.struct_logs.last().unwrap().gas_cost, 100);
+}
+
+#[test]
+fn call_dynamic_charge_memory_and_other_error_controls() {
+    // A paid memory expansion is part of the attempted Parity charge, but Geth's
+    // failed intrinsic calculation still reports only the constant CALL cost.
+    let inspector = inspect_child(&hex!("60006000600160006001604461fffff100"), 34_623);
+    let step = inspector.traces().nodes()[1].trace.steps.last().unwrap();
+    assert_eq!(step.status, Some(InstrStop::OutOfGas));
+    assert_eq!(step.gas_cost, 36_603);
+    assert_eq!(step.geth_gas_cost, Some(100));
+
+    for (code, gas, status) in [
+        (&hex!("6000600060016104006000604461fffff100")[..], 171, InstrStop::MemoryOOG),
+        (&[op::CALL][..], 1000, InstrStop::StackUnderflow),
+    ] {
+        let inspector = inspect_child(code, gas);
+        let step = inspector.traces().nodes()[1].trace.steps.last().unwrap();
+        assert_eq!(step.status, Some(status));
+        assert_eq!(step.geth_gas_cost, None);
+    }
+
+    let inspector = inspect_code(
+        &hex!("5f5f5f5f604361fffffa00"),
+        &hex!("60006000600060006001604461fffff100"),
+        SpecId::OSAKA,
+        TracingInspectorConfig::all(),
+    );
+    let step = inspector.traces().nodes()[1].trace.steps.last().unwrap();
+    assert_eq!(step.status, Some(InstrStop::CallNotAllowedInsideStatic));
+    assert_eq!(step.geth_gas_cost, None);
+}
