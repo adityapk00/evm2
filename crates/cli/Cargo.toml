@@ -86,6 +86,11 @@ revm = { workspace = true, features = ["test-types"] }
 name = "evm"
 harness = false
 
+[[bench]]
+name = "llc"
+harness = false
+required-features = ["jit"]
+
 [[example]]
 name = "llc_jit"
 required-features = ["jit"]
