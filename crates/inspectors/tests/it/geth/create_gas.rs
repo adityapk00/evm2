@@ -1,6 +1,7 @@
 //! Creation opcode costs in structured logs and the other trace formats.
 
 use super::*;
+use evm2_inspectors::tracing::StackSnapshotType;
 
 fn inspect(
     code: &[u8],
@@ -68,7 +69,11 @@ fn structured_create_cost_excludes_forwarded_gas() {
                 } else {
                     2
                 };
-            for config in [TracingInspectorConfig::default_geth(), TracingInspectorConfig::all()] {
+            for config in [
+                TracingInspectorConfig::default_geth(),
+                TracingInspectorConfig::all(),
+                TracingInspectorConfig::default_geth().set_stack_snapshots(StackSnapshotType::None),
+            ] {
                 let (inspector, gas_used, root_success) = inspect(&code, &[], gas, config);
                 assert!(root_success);
                 let nodes = inspector.traces().nodes();
@@ -101,12 +106,10 @@ fn structured_create_cost_excludes_forwarded_gas() {
                 assert_eq!(call.calls[0].gas, U256::from(child.gas_limit));
                 assert_eq!(call.calls[0].gas_used, U256::from(spent));
 
-                if config.record_step_deltas {
-                    let parity = inspector.clone().into_parity_builder().vm_trace();
-                    let create = &parity.ops[parity.ops.len() - 2];
-                    assert_eq!(create.cost, cost + child.gas_limit);
-                    assert_eq!(create.ex.as_ref().unwrap().used, available - spent);
-                }
+                let parity = inspector.clone().into_parity_builder().vm_trace();
+                let create = &parity.ops[parity.ops.len() - 2];
+                assert_eq!(create.cost, cost + child.gas_limit);
+                assert_eq!(create.ex.as_ref().unwrap().used, available - spent);
             }
         }
     }

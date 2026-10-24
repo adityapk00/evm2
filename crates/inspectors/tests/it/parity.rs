@@ -524,21 +524,23 @@ fn vmtrace_reports_remaining_gas_after_execution() {
 #[test]
 fn vmtrace_reports_remaining_gas_after_storage_credit() {
     // Restore a newly written slot to zero, crediting gas spilled from the state gas reservoir.
-    let inspector = inspect_code(
-        &hex!("60015f555f5f5500"),
-        &[],
-        SpecId::AMSTERDAM,
-        TracingInspectorConfig::parity_vm_trace(),
-    );
-    let steps = &inspector.traces().nodes()[0].trace.steps;
-    let gas_after = steps[6].gas_remaining;
-    assert!(gas_after > steps[5].gas_remaining);
-    let trace = inspector.into_parity_builder().vm_trace();
-    assert_eq!(trace.ops[5].ex.as_ref().unwrap().used, gas_after);
+    for deltas in [false, true] {
+        let inspector = inspect_code(
+            &hex!("60015f555f5f5500"),
+            &[],
+            SpecId::AMSTERDAM,
+            TracingInspectorConfig::parity_vm_trace().set_step_deltas(deltas),
+        );
+        let steps = &inspector.traces().nodes()[0].trace.steps;
+        let gas_after = steps[6].gas_remaining;
+        assert!(gas_after > steps[5].gas_remaining);
+        let trace = inspector.into_parity_builder().vm_trace();
+        assert_eq!(trace.ops[5].ex.as_ref().unwrap().used, gas_after);
+    }
 }
 
 #[test]
-fn non_vm_traces_do_not_record_step_deltas() {
+fn non_vm_traces_only_record_gas_deltas() {
     // Exercise a memory write, a call and a storage gas credit.
     let code = hex!("602a5f525f5f5f5f5f604361fffff15060015f555f5f5500");
     for config in [
@@ -547,7 +549,20 @@ fn non_vm_traces_do_not_record_step_deltas() {
         TracingInspectorConfig::from_geth_call_config(&Default::default()),
     ] {
         let inspector = inspect_code(&code, &hex!("00"), SpecId::AMSTERDAM, config);
-        assert!(inspector.traces().nodes().iter().all(|node| node.trace.step_deltas.is_empty()));
+        for node in inspector.traces().nodes() {
+            for delta in &node.trace.step_deltas {
+                assert!(delta.gas_remaining_after.is_some());
+                assert!(delta.memory.is_none());
+                assert!(delta.store.is_none());
+            }
+        }
+        if config.record_steps {
+            assert_eq!(inspector.traces().nodes()[0].trace.step_deltas.len(), 2);
+        } else {
+            assert!(
+                inspector.traces().nodes().iter().all(|node| node.trace.step_deltas.is_empty())
+            );
+        }
     }
 }
 
@@ -1216,3 +1231,6 @@ fn vmtrace_nested_calls_preserve_each_forwarded_cost() {
     );
     assert_eq!(inner.ex.as_ref().unwrap().used, child.ops[6].ex.as_ref().unwrap().used - 100 - 15);
 }
+
+#[path = "parity/call_gas_regressions.rs"]
+mod call_gas_regressions;

@@ -108,6 +108,7 @@ impl<'a> GethTraceBuilder<'a> {
             if matches!(step.op.get(), op::CREATE | op::CREATE2)
                 && let Some(child_id) = call_child_id
             {
+                // Geth logs CREATE before its opcode implementation forwards gas to the child.
                 log.gas_cost = log.gas_cost.saturating_sub(self.nodes[child_id].trace.gas_limit);
             }
 
