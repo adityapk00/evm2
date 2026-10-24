@@ -141,7 +141,7 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::Inspector;
+    use super::*;
     use crate::{
         BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, Precompiles, SpecId,
         bytecode::Bytecode,
@@ -311,6 +311,7 @@ mod tests {
         logs: Vec<Log>,
         calls: usize,
         creates: usize,
+        create_results: Vec<MessageResult<BaseEvmTypes>>,
     }
 
     #[derive(Default)]
@@ -351,6 +352,15 @@ mod tests {
         ) -> Option<MessageResult<BaseEvmTypes>> {
             self.state.creates += 1;
             None
+        }
+
+        fn create_end(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            _message: &Message<BaseEvmTypes>,
+            result: &mut MessageResult<BaseEvmTypes>,
+        ) {
+            self.state.create_results.push(result.clone());
         }
     }
 
@@ -1668,6 +1678,132 @@ mod tests {
 
             assert_eq!(stop, Ok(expected));
             assert_eq!(interp.gas().remaining(), 1000);
+        }
+    }
+
+    #[test]
+    fn empty_creations_do_not_inspect_padding_stop() {
+        let caller = Address::repeat_byte(0xaa);
+        let parent = Address::repeat_byte(0xbb);
+        for nested in [None, Some(op::CREATE), Some(op::CREATE2)] {
+            for initcode in [vec![], vec![op::STOP]] {
+                for value in [0, 7] {
+                    let mut code = Vec::new();
+                    if let Some(opcode) = nested {
+                        if opcode == op::CREATE2 {
+                            code.push(op::PUSH0);
+                        }
+                        code.extend([
+                            op::PUSH1,
+                            initcode.len() as u8,
+                            op::PUSH0,
+                            op::PUSH1,
+                            value,
+                            opcode,
+                        ]);
+                        return_top_word(&mut code);
+                    }
+                    let created = match nested {
+                        None => caller.create(0),
+                        Some(op::CREATE2) => parent.create2_from_code([0; 32], &initcode),
+                        _ => parent.create(0),
+                    };
+                    let tx = Recovered::new_unchecked(
+                        TxEnvelope::Legacy(TxLegacy {
+                            to: nested.map_or(TxKind::Create, |_| TxKind::Call(parent)),
+                            input: if nested.is_none() {
+                                initcode.clone().into()
+                            } else {
+                                Bytes::new()
+                            },
+                            value: if nested.is_none() { U256::from(value) } else { U256::ZERO },
+                            gas_limit: 200_000,
+                            ..Default::default()
+                        }),
+                        caller,
+                    );
+                    let run = |inspect| {
+                        let mut db = InMemoryDB::default();
+                        db.insert_account_info(
+                            &caller,
+                            AccountInfo::default().with_balance(U256::from(1_000_000)),
+                        );
+                        db.insert_account_info(
+                            &parent,
+                            AccountInfo::default()
+                                .with_balance(U256::from(100))
+                                .with_code(legacy_bytecode(code.clone())),
+                        );
+                        let mut evm = Evm::<BaseEvmTypes>::new(
+                            SpecId::OSAKA,
+                            BlockEnvExt::default(),
+                            ethereum_tx_registry(SpecId::OSAKA),
+                            db,
+                            Precompiles::base(SpecId::OSAKA),
+                        );
+                        if inspect {
+                            evm.set_inspector(SharedE2eInspector::default());
+                        }
+                        let result = evm.transact(&tx).unwrap().detach();
+                        (result, evm.clear_inspector_as::<SharedE2eInspector>())
+                    };
+                    let (plain, _) = run(false);
+                    let (inspected, inspector) = run(true);
+                    assert_eq!(inspected.result, plain.result);
+                    assert_eq!(inspected.pending_state, plain.pending_state);
+                    assert!(inspected.result.status);
+                    assert_eq!(inspected.result.refunded, 0);
+                    let nonempty = !initcode.is_empty();
+                    let gas_used = if let Some(opcode) = nested {
+                        53_021
+                            + 2 * u64::from(opcode == op::CREATE2)
+                            + u64::from(nonempty) * if opcode == op::CREATE2 { 8 } else { 2 }
+                    } else {
+                        53_000 + 6 * u64::from(nonempty)
+                    };
+                    assert_eq!(inspected.result.tx_gas_used(), gas_used);
+                    if nested.is_some() {
+                        assert_eq!(
+                            inspected.result.output.as_ref(),
+                            &address_to_word(&created).to_be_bytes::<32>()
+                        );
+                    } else {
+                        assert_eq!(inspected.result.created_address, Some(created));
+                        assert!(inspected.result.output.is_empty());
+                    }
+                    let state = &inspected.pending_state;
+                    assert_eq!(state.account_info(&caller).unwrap().nonce, 1);
+                    let creator = state
+                        .account_info(&if nested.is_some() { parent } else { caller })
+                        .unwrap();
+                    assert_eq!(creator.nonce, 1);
+                    assert_eq!(
+                        creator.balance,
+                        U256::from(if nested.is_some() { 100 } else { 1_000_000 })
+                            - U256::from(value)
+                    );
+                    let account = state.account_info(&created).unwrap();
+                    assert_eq!(account.nonce, 1);
+                    assert_eq!(account.balance, U256::from(value));
+                    assert!(account.code.as_ref().is_none_or(Bytecode::is_empty));
+                    assert!(account.is_empty_code_hash());
+
+                    let hooks = &inspector.unwrap().state;
+                    assert_eq!(hooks.initialized, 1 + usize::from(nested.is_some()));
+                    assert_eq!(hooks.calls, usize::from(nested.is_some()));
+                    assert_eq!(hooks.creates, 1);
+                    let parent_steps =
+                        nested.map_or(0, |opcode| 9 + usize::from(opcode == op::CREATE2));
+                    assert_eq!(hooks.steps, parent_steps + usize::from(nonempty));
+                    assert_eq!(hooks.step_ends, hooks.steps);
+                    assert_eq!(hooks.create_results.len(), 1);
+                    let result = &hooks.create_results[0];
+                    assert_eq!(result.stop, InstrStop::Stop);
+                    assert_eq!(result.created_address, Some(created));
+                    assert!(result.output.is_empty());
+                    assert_eq!(result.gas.spent(), 0);
+                }
+            }
         }
     }
 }

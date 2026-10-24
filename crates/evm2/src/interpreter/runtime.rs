@@ -452,6 +452,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
         let stop = if self.error.is_some() {
             InstrStop::FatalExternalError
+        } else if self.bytecode.is_empty() {
+            // Empty bytecode has no opcode to execute or inspect, including the padding STOP.
+            let stop = self.result.err().unwrap_or(InstrStop::Stop);
+            self.result = Err(stop);
+            stop
         } else {
             // Load the table only after setup: passing it in keeps it in a callee-saved register
             // across setup, which makes the dispatch loop spill the stack pointer.
@@ -772,12 +777,14 @@ mod owned_error_tests {
 mod bytecode_padding_tests {
     use super::*;
     use crate::{
+        env::TxEnvExt,
+        evm::inspector::NoopInspector,
         interpreter::op,
-        test_utils::{RunConfig, run},
+        test_utils::{RunConfig, TestHost, TestTypes, run},
     };
 
     #[test]
-    fn empty_code_reads_padding_stop() {
+    fn empty_code_stops() {
         let interp = run(RunConfig::default());
         assert_eq!(interp.err, InstrStop::Stop);
     }
@@ -794,5 +801,21 @@ mod bytecode_padding_tests {
         let interp = run(RunConfig::new([op::PUSH1, 3, op::JUMP, op::JUMPDEST]));
         assert_eq!(interp.err, InstrStop::Stop);
         assert!(interp.stack().is_empty());
+    }
+
+    #[test]
+    fn empty_code_retains_interpreter_stop_status() {
+        for initial in [Ok(()), Err(InstrStop::Revert)] {
+            let tx_env = TxEnvExt::default();
+            let message = Message::<TestTypes>::default();
+            let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);
+            interp.set_result(initial);
+            let expected = initial.err().unwrap_or(InstrStop::Stop);
+            assert_eq!(
+                interp.run_inspect(&mut TestHost::default(), &mut NoopInspector::default()),
+                Ok(expected)
+            );
+            assert_eq!(interp.result(), Err(expected));
+        }
     }
 }
