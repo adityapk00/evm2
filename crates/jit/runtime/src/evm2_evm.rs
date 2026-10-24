@@ -637,7 +637,7 @@ mod tests {
                     call_target: parent,
                     code_address: parent,
                     caller,
-                    input: hex!("01020304").into(),
+                    input: Bytes::from_static(&hex!("01020304")).into(),
                     code: Bytecode::new_legacy(code.into()),
                     ..Default::default()
                 };
