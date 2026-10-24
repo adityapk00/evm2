@@ -675,7 +675,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
             self.0.failed_charge =
                 Some(self.0.step_gas_before.wrapping_sub(self.0.gas.remaining()));
             // Ordinary failed charges may wrap the counter. Memory expansion and
-            // other OOG guards preserve it, matching revm's halt behavior.
+            // other OOG guards preserve it.
             self.0.gas.set_remaining(0);
         } else if self.0.result == Err(InstrStop::MemoryOOG) {
             cold_path();

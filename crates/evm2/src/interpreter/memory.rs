@@ -135,8 +135,8 @@ impl Memory {
         let cost =
             unsafe { gas.memory_mut().set_words_num(new_num_words, cost).unwrap_unchecked() };
 
-        // Like revm's checked memory charge, preserve the balance on failure so
-        // step_end sees only charges paid before the expansion was attempted.
+        // Preserve the balance on failure so step_end sees only charges paid
+        // before the expansion was attempted.
         let Some(remaining) = gas.remaining().checked_sub(cost) else {
             return Err(InstrStop::MemoryOOG);
         };
