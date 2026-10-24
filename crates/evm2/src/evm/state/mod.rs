@@ -387,6 +387,13 @@ impl<'a> State<'a> {
             || self.inner.prewarm_set.is_storage_warm(address, key)
     }
 
+    /// Returns an account's effective warmth without loading it or changing the access set.
+    #[inline]
+    pub fn is_account_warm(&self, address: &Address) -> bool {
+        self.accounts.get(address).is_some_and(|account| account.is_warm)
+            || self.inner.prewarm_set.is_warm(address)
+    }
+
     /// Sets the warmth of an already-loaded storage slot without journaling the change.
     ///
     /// Does nothing for unloaded slots and leaves values and the pre-warmed set unchanged.
@@ -1474,5 +1481,23 @@ mod tests {
 
         assert_eq!(parent.account(&address).unwrap().nonce(), 1);
         assert_eq!(parent.storage_slot_untracked(&address, &key).unwrap(), Word::from(9));
+    }
+
+    #[test]
+    fn account_warmth_peek_does_not_load_and_tracks_rollback() {
+        let address = Address::with_last_byte(42);
+        let prewarmed = Address::with_last_byte(43);
+        let mut state = State::new(EmptyDB::default());
+        state.prewarm(&prewarmed);
+        assert!(!state.is_account_warm(&address));
+        assert!(state.is_account_warm(&prewarmed));
+        assert!(state.accounts.is_empty());
+        assert!(state.journal().is_empty());
+        let checkpoint = state.checkpoint();
+        state.account(&address).unwrap().warm();
+        assert!(state.is_account_warm(&address));
+        state.rollback(checkpoint, crate::EvmFeatures::empty());
+        assert!(!state.is_account_warm(&address));
+        assert!(state.is_account_warm(&prewarmed));
     }
 }

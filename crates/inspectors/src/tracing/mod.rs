@@ -53,6 +53,9 @@ use types::{CallLog, CallTrace, CallTraceStep};
 
 mod tx_state;
 
+mod copy_gas;
+use copy_gas::PendingCopyGas;
+
 mod utils;
 
 #[cfg(feature = "std")]
@@ -118,6 +121,8 @@ pub struct TracingInspector {
     ///
     /// All `Vec<CallTraceStep>` are always empty but may have capacity.
     reusable_step_vecs: Vec<Vec<CallTraceStep>>,
+    /// The pending copy requirements. Copy instructions cannot open a child frame.
+    pending_copy_gas: Option<PendingCopyGas>,
 }
 
 impl TracingInspector {
@@ -157,6 +162,7 @@ impl TracingInspector {
             last_journal_len,
             spec_id,
             features,
+            pending_copy_gas,
             // kept
             config,
             budget,
@@ -182,6 +188,7 @@ impl TracingInspector {
         spec_id.take();
         *features = EvmFeatures::empty();
         *last_journal_len = 0;
+        *pending_copy_gas = None;
         budget.recorded = 0;
         budget.exceeded = false;
     }
@@ -465,6 +472,7 @@ impl TracingInspector {
         let op = OpCode::new_or_unknown(interp.opcode());
 
         let trace_idx = self.last_trace_idx();
+        self.pending_copy_gas = None;
 
         let record = !self.budget.exceeded()
             && self.config.should_record_opcode(op)
@@ -475,6 +483,7 @@ impl TracingInspector {
             return;
         }
 
+        self.pending_copy_gas = PendingCopyGas::capture(interp);
         self.recorded_steps += 1;
         let node = &mut self.traces.arena[trace_idx];
 
@@ -604,6 +613,7 @@ impl TracingInspector {
     /// Invoked on [Inspector::step_end].
     #[cold]
     fn fill_step_on_step_end<T: EvmTypes>(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        let copy_cost = self.pending_copy_gas.take().and_then(|gas| gas.failed_cost(interp));
         let Some((trace_idx, step_idx)) = self.step_stack.pop() else {
             return;
         };
@@ -694,6 +704,7 @@ impl TracingInspector {
         if interp.result() != Err(InstrStop::OutOfGas) {
             step.geth_gas_cost = None;
         }
+        step.geth_gas_cost = copy_cost.or(step.geth_gas_cost);
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
