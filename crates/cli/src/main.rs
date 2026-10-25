@@ -1,6 +1,8 @@
 //! User-facing `evm2` command-line tool.
 
 mod args;
+#[cfg(all(feature = "jit", target_os = "linux"))]
+mod bundle;
 mod capture;
 mod error;
 mod ethereum;
@@ -52,6 +54,10 @@ fn run() -> Result<()> {
         args::Command::Replay(command) => replay::run(command),
         #[cfg(feature = "jit")]
         args::Command::Run(command) => command.run().map_err(|source| error::Error::Run { source }),
+        #[cfg(all(feature = "jit", target_os = "linux"))]
+        args::Command::Bundle(command) => {
+            command.run().map_err(|source| error::Error::Run { source })
+        }
     }
 }
 

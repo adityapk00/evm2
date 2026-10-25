@@ -49,6 +49,7 @@ zstd.workspace = true
 evm2-jit-context = { workspace = true, optional = true }
 evm2-jit-llvm = { workspace = true, optional = true }
 evm2-jit-runtime = { workspace = true, features = ["llvm"], optional = true }
+libc = { workspace = true, optional = true }
 libloading = { version = "0.9", optional = true }
 open = { version = "5", optional = true }
 
@@ -70,6 +71,7 @@ jit = [
     "dep:evm2-jit-llvm",
     "dep:evm2-jit-runtime",
     "dep:evm2-jit-build",
+    "dep:libc",
     "dep:libloading",
     "dep:open",
 ]

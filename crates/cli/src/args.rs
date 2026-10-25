@@ -23,6 +23,9 @@ pub(crate) enum Command {
     /// Compile and/or run EVM bytecode.
     #[cfg(feature = "jit")]
     Run(crate::run::RunArgs),
+    /// Deploy and call contracts from a bundle, timing each call on the interpreter and the JIT.
+    #[cfg(all(feature = "jit", target_os = "linux"))]
+    Bundle(crate::bundle::BundleArgs),
 }
 
 #[derive(Debug, clap::Args)]

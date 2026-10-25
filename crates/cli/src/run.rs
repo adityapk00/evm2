@@ -279,6 +279,9 @@ impl RunArgs {
             0 => {}
             1 if !self.interpret || self.jit_only => prepared.sanity_check()?,
             _ => {
+                if !self.interpret && !self.jit_only {
+                    prepared.sanity_check()?;
+                }
                 if self.interpret || !self.jit_only {
                     bench(self.n_iters, &format!("{name}/interpreter"), || {
                         prepared.run_interpreter()
@@ -615,10 +618,14 @@ impl PreparedBench {
             );
         }
         eyre::ensure!(
-            interpreter.status == jit.status,
+            interpreter.status == jit.status && interpreter.output == jit.output,
             "interpreter and JIT results differ:\n  interpreter: {:?}\n  JIT: {:?}",
             interpreter,
             jit
+        );
+        eprintln!(
+            "{}: gas_used={} output={}",
+            self.name, interpreter.total_gas_spent, interpreter.output
         );
         Ok(())
     }
