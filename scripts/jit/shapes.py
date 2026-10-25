@@ -516,14 +516,11 @@ def run_bundles(args, out: list[str]):
     out.append("| case | " + " | ".join(f"{v} interp | {v} JIT" for v in variants) + " |")
     out.append("|---|" + "---:|---:|" * len(variants))
     totals = {v: [0.0] * 4 for v in variants}
-    # Only cases that the base variant has, so that the totals compare the same calls.
-    for t in (t for t in cases if (base, t) in sums):
+    # Only cases that every variant has, so that the totals compare the same calls.
+    for t in (t for t in cases if all((v, t) in sums for v in variants)):
         cells = []
         for v in variants:
-            s = sums.get((v, t))
-            if s is None:
-                cells += ["-", "-"]
-                continue
+            s = sums[v, t]
             for i in range(4):
                 totals[v][i] += s[i]
             b = sums[base, t]
