@@ -3,7 +3,7 @@
 use crate::{
     BaseEvmConfigSelector, EvmConfig, EvmConfigSelector, EvmTypesHost, OpcodeConfig,
     evm::config::SelectorOpcodeConfig,
-    interpreter::{Interpreter, InterpreterState, Pc, RawStack, op},
+    interpreter::{Interpreter, InterpreterState, Pc, RawStack, fused, op},
     trustme,
 };
 
@@ -44,7 +44,7 @@ const fn inc_pc(pc: &mut Pc, op: u8) {
 #[inline(always)]
 const fn instruction_len(op: u8) -> usize {
     match op {
-        op::JUMP | op::JUMPI => 0, // Set inside.
+        op::JUMP | op::JUMPI | fused::FIRST..=fused::LAST => 0, // Set inside.
         op::PUSH1..=op::PUSH32 => (op - op::PUSH1 + 2) as usize,
         op::DUPN | op::SWAPN | op::EXCHANGE => 2,
         _ => 1,
@@ -122,6 +122,58 @@ where
     table
 }
 
+/// Extends `base`, the uninspected table of `C`, with the synthetic opcode handlers, if `C`
+/// supports fusion.
+const fn make_fused_table<T, C>(base: &InstrTable<T>) -> Option<InstrTable<T>>
+where
+    T: EvmTypesHost,
+    C: EvmConfig<T>,
+{
+    if !fused::is_enabled::<T, C>() {
+        return None;
+    }
+    let mut table = *base;
+    macro_rules! assign {
+        ($($op:ident,)*) => {$(
+            table[fused::$op as usize] =
+                imp::dispatch::<T, FusedConfig<C>, NoInspector, { fused::$op }> as imp::RawInstrFn<T>;
+        )*};
+    }
+    assign! {
+        PUSH2_JUMP, PUSH2_JUMPI, ISZERO_PUSH2_JUMPI, PUSH1_JUMP, PUSH1_JUMPI, POP_POP, SWAP1_POP,
+        SWAP2_POP, PUSH1_ADD,
+    }
+    Some(table)
+}
+
+/// `C` with the synthetic opcodes of fused bytecode.
+struct FusedConfig<C>(core::marker::PhantomData<C>);
+
+impl<T: EvmTypesHost, C: EvmConfig<T>> EvmConfig<T> for FusedConfig<C> {
+    const BASE_SPEC_ID: crate::SpecId = C::BASE_SPEC_ID;
+    const OPCODE_CONFIG: &'static OpcodeConfig<T> = &fused::opcode_config::<T, C>();
+}
+
+const fn make_selector_fused_tables<T, F, const CUSTOM_SPEC_ID: u32>(
+    base: &[InstrTable<T>; crate::SpecId::COUNT],
+) -> [Option<InstrTable<T>>; crate::SpecId::COUNT]
+where
+    T: EvmTypesHost,
+    F: EvmConfigSelector<T>,
+{
+    macro_rules! make_selector_fused_tables {
+        ([$($extra:tt)*] $($spec:ident $name:ident,)*) => {
+            [$(
+                make_fused_table::<T, F::Config<{ crate::SpecId::$spec as u32 }, CUSTOM_SPEC_ID>>(
+                    &base[crate::SpecId::$spec as usize],
+                ),
+            )*]
+        };
+    }
+
+    crate::for_each_spec!([] make_selector_fused_tables)
+}
+
 const fn make_selector_tables<T, F, M, const CUSTOM_SPEC_ID: u32>()
 -> [InstrTable<T>; crate::SpecId::COUNT]
 where
@@ -178,6 +230,8 @@ where
                 [C::BASE_SPEC_ID as usize],
         ),
     );
+    pub(crate) const FUSED_INSTRUCTIONS: &'static Option<InstrTable<T>> =
+        &make_fused_table::<T, C>(Self::INSTRUCTIONS);
     pub(crate) const INSPECT_INSTRUCTIONS: &'static InstrTable<T> = &make_table::<T, C, DynInspector>(
         Some(
             &SelectorInstrTables::<T, BaseEvmConfigSelector, { u32::MAX }>::INSPECT_INSTRUCTIONS
@@ -201,6 +255,8 @@ where
 {
     pub(crate) const INSTRUCTIONS: &'static [InstrTable<T>; crate::SpecId::COUNT] =
         &make_selector_tables::<T, F, NoInspector, CUSTOM_SPEC_ID>();
+    pub(crate) const FUSED_INSTRUCTIONS: &'static [Option<InstrTable<T>>; crate::SpecId::COUNT] =
+        &make_selector_fused_tables::<T, F, CUSTOM_SPEC_ID>(Self::INSTRUCTIONS);
     pub(crate) const INSPECT_INSTRUCTIONS: &'static [InstrTable<T>; crate::SpecId::COUNT] =
         &make_selector_tables::<T, F, DynInspector, CUSTOM_SPEC_ID>();
 }

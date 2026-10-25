@@ -2,13 +2,17 @@
 
 use crate::{
     constants::{EIP7702_BYTECODE_LEN, EIP7702_MAGIC_BYTES, EIP7702_VERSION},
-    interpreter::op,
+    interpreter::{fused, op},
     once_lock::OnceLock,
 };
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, keccak256};
 use analysis::{analyze_legacy, pad_legacy};
-use core::{cmp::Ordering, fmt, hash};
+use core::{
+    cmp::Ordering,
+    fmt, hash,
+    sync::atomic::{self, AtomicUsize},
+};
 use thiserror::Error;
 
 mod analysis;
@@ -43,6 +47,10 @@ pub enum BytecodeDecodeError {
     Eip7702(#[from] Eip7702DecodeError),
 }
 
+/// Gas that frames must spend running bytecode, per byte of code, before it is translated for
+/// fused execution. Tests translate all bytecode.
+const FUSE_GAS_PER_BYTE: usize = if cfg!(test) { 0 } else { 256 };
+
 /// Ethereum EVM bytecode.
 #[derive(Clone)]
 pub struct Bytecode(Option<Arc<BytecodeInner>>);
@@ -63,6 +71,10 @@ struct BytecodeInner {
     original_len: usize,
     /// Lazily initialized jump table for legacy bytecode.
     jump_table: OnceLock<JumpTable>,
+    /// Bytecode translated for fused execution, with the same layout as `bytecode`.
+    fused: OnceLock<Box<[u8]>>,
+    /// Gas that frames spent running this bytecode before it was translated.
+    unfused_gas: AtomicUsize,
     /// Cached hash of the original bytecode.
     hash: OnceLock<B256>,
 }
@@ -136,6 +148,8 @@ impl Bytecode {
             bytecode: Bytes::from_static(&[op::STOP]),
             original_len: 0,
             jump_table: OnceLock::new(),
+            fused: OnceLock::new(),
+            unfused_gas: AtomicUsize::new(0),
             hash: {
                 let hash = OnceLock::new();
                 let _ = hash.set(KECCAK256_EMPTY);
@@ -169,6 +183,8 @@ impl Bytecode {
             original_len,
             bytecode,
             jump_table: OnceLock::new(),
+            fused: OnceLock::new(),
+            unfused_gas: AtomicUsize::new(0),
             hash: OnceLock::new(),
         })))
     }
@@ -193,6 +209,8 @@ impl Bytecode {
             original_len: raw.len(),
             bytecode: raw,
             jump_table: OnceLock::new(),
+            fused: OnceLock::new(),
+            unfused_gas: AtomicUsize::new(0),
             hash: OnceLock::new(),
         })))
     }
@@ -228,6 +246,8 @@ impl Bytecode {
             original_len: bytes.len(),
             bytecode: bytes,
             jump_table: OnceLock::new(),
+            fused: OnceLock::new(),
+            unfused_gas: AtomicUsize::new(0),
             hash: OnceLock::new(),
         }))))
     }
@@ -272,6 +292,8 @@ impl Bytecode {
                 let _ = cached.set(jump_table);
                 cached
             },
+            fused: OnceLock::new(),
+            unfused_gas: AtomicUsize::new(0),
             hash: OnceLock::new(),
         })))
     }
@@ -319,6 +341,31 @@ impl Bytecode {
                 JumpTable::default()
             }
         })
+    }
+
+    /// Returns the bytecode translated for fused execution, once frames have spent enough gas
+    /// running it to pay for the translation.
+    ///
+    /// The result has the same length and instruction layout as [`Self::bytes_slice`].
+    #[inline]
+    pub(crate) fn fused_bytes(&self) -> Option<&[u8]> {
+        let inner = self.0.as_deref().filter(|inner| inner.kind == BytecodeKind::Legacy)?;
+        if let Some(fused) = inner.fused.get() {
+            return Some(fused);
+        }
+        let gas = inner.unfused_gas.load(atomic::Ordering::Relaxed);
+        if gas < FUSE_GAS_PER_BYTE * inner.original_len {
+            return None;
+        }
+        Some(inner.fused.get_or_init(|| fused::fuse(self.bytes_slice(), self.jump_table())))
+    }
+
+    /// Records gas that a frame spent running this bytecode before it was translated.
+    #[inline]
+    pub(crate) fn record_unfused_gas(&self, gas: u64) {
+        if let Some(inner) = &self.0 {
+            inner.unfused_gas.fetch_add(gas as usize, atomic::Ordering::Relaxed);
+        }
     }
 
     /// Calculates or returns cached hash of the bytecode.

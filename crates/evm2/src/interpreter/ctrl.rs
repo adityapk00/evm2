@@ -22,6 +22,14 @@ impl<'a> BytecodeRef<'a> {
         }
     }
 
+    /// Creates a view of the fused translation of `bytecode`, if it has one.
+    pub(crate) fn new_fused(bytecode: &'a Bytecode) -> Option<Self> {
+        Some(Self {
+            base: NonNull::from(bytecode.fused_bytes()?).cast(),
+            jump_table: bytecode.jump_table().as_ref(),
+        })
+    }
+
     /// Returns a pointer to the start of the bytecode.
     #[inline]
     pub const fn as_ptr(&self) -> *const u8 {

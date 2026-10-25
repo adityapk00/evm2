@@ -157,8 +157,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Returns the current bytecode-relative program counter.
     #[inline]
     pub fn pc(&self) -> usize {
-        // SAFETY: `pc` is always in bounds of `bytecode`.
-        unsafe { self.pc.offset_from(self.bytecode.original_byte_slice().as_ptr()) as usize }
+        // SAFETY: `pc` is always in bounds of the active bytecode view.
+        unsafe { self.pc.offset_from(self.bytecode().as_ptr()) as usize }
     }
 
     /// Sets the current bytecode-relative program counter.
@@ -168,16 +168,14 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Panics if `pc` is out of bounds of the active bytecode.
     #[inline]
     pub fn set_pc(&mut self, pc: usize) {
-        let bytecode = self.bytecode.bytes_slice();
-        assert!(pc < bytecode.len());
-        self.pc = unsafe { bytecode.as_ptr().add(pc) };
+        assert!(pc < self.bytecode.bytes_slice().len());
+        self.pc = unsafe { self.bytecode().as_ptr().add(pc) };
     }
 
     /// Returns the current opcode.
     #[inline]
-    pub const fn opcode(&self) -> u8 {
-        // SAFETY: `pc` is always in bounds of `bytecode`.
-        unsafe { *self.pc }
+    pub fn opcode(&self) -> u8 {
+        self.bytecode.bytes_slice()[self.pc()]
     }
 
     /// Returns the active bytecode.
@@ -457,11 +455,44 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             // across setup, which makes the dispatch loop spill the stack pointer.
             // SAFETY: `prepare_run` initialized the host, and the config is only read here.
             let config = unsafe { self.execution_config_detached() };
-            let instructions =
-                if inspector.is_some() { config.inspect_instructions } else { config.instructions };
-            dispatch::run(self, instructions)
+            if inspector.is_some() {
+                self.select_bytecode_view(false);
+                dispatch::run(self, config.inspect_instructions)
+            } else if let Some(fused) = config.fused_instructions
+                && self.select_bytecode_view(true)
+            {
+                dispatch::run(self, fused)
+            } else {
+                self.select_bytecode_view(false);
+                let gas = self.gas.remaining();
+                let stop = dispatch::run(self, config.instructions);
+                if config.fused_instructions.is_some() {
+                    self.bytecode.record_unfused_gas(gas.saturating_sub(self.gas.remaining()));
+                }
+                stop
+            }
         };
         self.finish_run(stop)
+    }
+
+    /// Points the bytecode view and `pc` at the fused or original bytecode, and returns whether
+    /// the view is fused.
+    ///
+    /// Both have the same layout, so `pc` keeps its offset.
+    #[inline]
+    fn select_bytecode_view(&mut self, fused: bool) -> bool {
+        // SAFETY: Same as in `prepare_run`.
+        let bytecode = unsafe { trustme::decouple_lt(&self.bytecode) };
+        let fused_view = if fused { BytecodeRef::new_fused(bytecode) } else { None };
+        let is_fused = fused_view.is_some();
+        let view = fused_view.unwrap_or_else(|| BytecodeRef::new(bytecode));
+        let current = self.bytecode();
+        if view.as_ptr() != current.as_ptr() {
+            let pc = current.pc_offset(Pc::new(self.pc));
+            self.pc = unsafe { view.as_ptr().add(pc) };
+            self.bytecode_ref = Some(view);
+        }
+        is_fused
     }
 
     /// Takes an owned error recorded by an instruction or inspector hook.
