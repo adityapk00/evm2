@@ -28,7 +28,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
-from utils import cargo_build, perf_counts, repo_root
+from utils import cargo_build, parse_duration, perf_counts, repo_root, total_iters
 
 GAS_BUDGET = 14_000_000
 MIX = "DUP2 XOR PUSH1 7 ADD"
@@ -49,7 +49,6 @@ class Pair:
     reps: int = 8
     spec: str = "osaka"
     note: str = ""
-    extra: dict = field(default_factory=dict)
 
 
 def loop_asm(v: Variant, reps: int, iters: int) -> str:
@@ -138,7 +137,7 @@ def suites() -> dict[str, list[Pair]]:
         ),
         Pair(
             "m1.push0",
-            [Variant("push0", "PUSH0 ADD DUP2 XOR"), Variant("push1_0", "PUSH1 0 ADD DUP2 XOR")],
+            [Variant("push0", f"PUSH0 ADD {MIX}"), Variant("push1_0", f"PUSH1 0 ADD {MIX}")],
         ),
     ]
     m2 = [
@@ -321,8 +320,8 @@ def run_evm2(
     for line in p.stderr.splitlines():
         if m := re.search(r": gas_used=(\d+) output=(\S*)", line):
             r.gas, r.output = int(m[1]), m[2]
-        elif m := re.search(r"/(interpreter|jit):\s*([\d.]+)(ns|µs|ms|s)\b", line):
-            r.tx_secs[m[1]] = float(m[2]) * {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}[m[3]]
+        elif m := re.search(r"/(interpreter|jit):(.*)", line):
+            r.tx_secs[m[1]] = parse_duration(m[2])
     return r
 
 
@@ -360,11 +359,6 @@ def asm_insts(lines: list[str]) -> int:
     return sum(1 for s in lines if not s.endswith(":"))
 
 
-def executed_txs(n: int) -> int:
-    """Transactions one `evm2 run` bench executes, including its warmup."""
-    return n + max(n // 10, 10)
-
-
 def measure(args, paths: list[str], spec: str, calldata: str | None, tx_secs: dict) -> dict:
     """Measures user-mode cycles and instructions per transaction on both engines.
 
@@ -385,7 +379,7 @@ def measure(args, paths: list[str], spec: str, calldata: str | None, tx_secs: di
                 samples[key][n].append(run_perf(args, key[0], n, spec, calldata, key[1]))
     res = {}
     for (p, engine), (a, b) in plan.items():
-        dtx = executed_txs(b) - executed_txs(a)
+        dtx = total_iters(b) - total_iters(a)
         cyc = (
             min(c for c, _ in samples[p, engine][b]) - min(c for c, _ in samples[p, engine][a])
         ) / dtx
@@ -490,7 +484,10 @@ def run_bundles(args, out: list[str]):
             if p.returncode != 0:
                 sys.exit(f"{' '.join(cmd)} failed:\n{p.stderr[-3000:]}")
             if r == 0:
-                print("\n".join(line for line in p.stderr.splitlines() if "!=" in line), flush=True)
+                print(
+                    "\n".join(line for line in p.stderr.splitlines() if "!= anvil" in line),
+                    flush=True,
+                )
             with open(jsonl) as f:
                 calls = [json.loads(line) for line in f]
             for c in calls:
@@ -519,7 +516,8 @@ def run_bundles(args, out: list[str]):
     out.append("| case | " + " | ".join(f"{v} interp | {v} JIT" for v in variants) + " |")
     out.append("|---|" + "---:|---:|" * len(variants))
     totals = {v: [0.0] * 4 for v in variants}
-    for t in cases:
+    # Only cases that the base variant has, so that the totals compare the same calls.
+    for t in (t for t in cases if (base, t) in sums):
         cells = []
         for v in variants:
             s = sums.get((v, t))

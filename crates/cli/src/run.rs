@@ -642,8 +642,8 @@ impl PreparedBench {
 }
 
 #[derive(Clone, Debug)]
-struct FixedJitRunner {
-    functions: Arc<HashMap<B256, EvmCompilerFn>>,
+pub(crate) struct FixedJitRunner {
+    pub(crate) functions: Arc<HashMap<B256, EvmCompilerFn>>,
 }
 
 impl InterpreterRunner<BaseEvmTypes> for FixedJitRunner {

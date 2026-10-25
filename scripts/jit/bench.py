@@ -51,12 +51,14 @@ from utils import (
     cargo_env,
     eprint,
     get_benches,
+    parse_duration,
     perf_available,
     perf_counts,
     repo_root,
     run_cli,
     strip_ansi,
     time_cli,
+    total_iters,
 )
 
 # ---------------------------------------------------------------------------
@@ -274,18 +276,6 @@ def mresize_call_count(path: str) -> int:
     except FileNotFoundError:
         pass
     return calls
-
-
-DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ns|µs|us|ms|s)")
-DURATION_UNITS = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}
-
-
-def parse_duration(s: str) -> float:
-    """Parse a Rust-style Duration debug string to seconds."""
-    m = DURATION_RE.search(s)
-    if not m:
-        return 0.0
-    return float(m.group(1)) * DURATION_UNITS[m.group(2)]
 
 
 class _Tee:
@@ -1032,14 +1022,6 @@ def measure(sides: list[Side], benches: list[str], runs: int, perf: bool):
 
 # Instructions spent executing per measurement, so compile-time noise stays negligible.
 RUNTIME_TARGET = 20e9
-
-
-def total_iters(n: int) -> int:
-    """`evm2 run <bench> N` runs `max(N / 10, 10)` warmup iterations before the timed ones.
-
-    Keep in sync with `bench` in `crates/cli/src/run.rs`.
-    """
-    return n + max(n // 10, 10)
 
 
 def runtime_per_iter(side: Side, bench: str) -> tuple[float, float]:

@@ -4,6 +4,7 @@
 //! `calls` as sequential transactions. Every call runs on the state left by the previous call:
 //! the timed repetitions are discarded and one more execution is committed.
 
+use crate::run::FixedJitRunner;
 use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
 use evm2::{
@@ -19,11 +20,9 @@ use evm2_jit_runtime::{EvmCompiler, eyre};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
+    io::Write,
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 /// Anvil's first default account.
@@ -36,8 +35,8 @@ pub(crate) struct BundleArgs {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
     /// Timed batches per call and engine; the reported cost is the median batch.
-    #[arg(long, default_value = "7")]
-    batches: usize,
+    #[arg(long, default_value = "7", value_parser = clap::value_parser!(u32).range(1..))]
+    batches: u32,
     /// Minimum user-mode cycles per batch; sets how many repetitions a batch runs.
     #[arg(long, default_value = "200000")]
     batch_cycles: u64,
@@ -75,8 +74,10 @@ impl BundleArgs {
         let mut compiler = EvmCompiler::new_llvm(false)?;
         compiler.set_dump_to(self.dump.clone());
         let mut out = self.out.as_ref().map(std::fs::File::create).transpose()?;
+        // Compiled code by bytecode hash, shared by all cases.
+        let mut functions = Arc::new(HashMap::new());
         for path in &self.paths {
-            let cases: Vec<Case> = serde_json::from_slice(&std::fs::read(path)?)?;
+            let cases = serde_json::from_slice::<Vec<Case>>(&std::fs::read(path)?)?;
             let mut total = [0.0; 4];
             let mut mismatches = 0;
             eprintln!("{}", path.display());
@@ -88,7 +89,8 @@ impl BundleArgs {
                 if self.filter.as_ref().is_some_and(|f| !case.test_id.contains(f.as_str())) {
                     continue;
                 }
-                let r = self.run_case(case, &counters, &mut compiler, out.as_mut())?;
+                let r =
+                    self.run_case(case, &counters, &mut compiler, &mut functions, out.as_mut())?;
                 eprintln!(
                     "{:<30} {:>5} {:>12.0} {:>12.0} {:>12.0} {:>12.0} {:>6}",
                     case.test_id,
@@ -124,38 +126,29 @@ impl BundleArgs {
         case: &Case,
         counters: &Counters,
         compiler: &mut EvmCompiler<EvmLlvmBackend>,
+        functions: &mut Arc<HashMap<B256, EvmCompilerFn>>,
         mut out: Option<&mut std::fs::File>,
     ) -> eyre::Result<CaseResult> {
         let mut db = InMemoryDB::default();
         db.insert_account_info(&CALLER, AccountInfo::default().with_balance(U256::MAX >> 8));
         let new_evm = || {
-            let block = BlockEnvExt { number: U256::ONE, ..Default::default() };
-            let mut evm = Evm::<BaseEvmTypes>::new(
-                SPEC,
-                block,
-                ethereum_tx_registry(SPEC),
-                db.clone(),
-                Precompiles::base(SPEC),
-            );
             // Like anvil's `--disable-code-size-limit`, which the bundles were recorded with.
             let mut version = *Version::base(SPEC);
             version.max_code_size = usize::MAX;
             version.max_initcode_size = usize::MAX;
-            evm.set_block_and_execution_config(
-                block,
+            Evm::<BaseEvmTypes>::new_with_execution_config(
                 ExecutionConfig::for_spec_and_version(SPEC, version),
                 SPEC,
+                BlockEnvExt { number: U256::ONE, ..Default::default() },
                 ethereum_tx_registry(SPEC),
+                db.clone(),
                 Precompiles::base(SPEC),
-            );
-            evm
+            )
         };
         let mut interp = new_evm();
         let mut jit = new_evm();
         let codes = Arc::new(Mutex::new(HashMap::new()));
         let recorder = Recorder { codes: Arc::clone(&codes) };
-        let mut functions = HashMap::<B256, EvmCompilerFn>::new();
-        let misses = Arc::new(AtomicU64::new(0));
 
         let deploy = tx(0, TxKind::Create, case.creation.clone());
         interp.set_interpreter_runner(recorder.clone());
@@ -194,22 +187,14 @@ impl BundleArgs {
                     compiler.set_module_name(&name);
                     let f = unsafe { compiler.jit(&name, code, SPEC)? };
                     compiler.clear_ir()?;
-                    functions.insert(*hash, f);
+                    Arc::make_mut(functions).insert(*hash, f);
                 }
             }
-            jit.set_interpreter_runner(JitRunner {
-                functions: Arc::new(functions.clone()),
-                misses: Arc::clone(&misses),
-            });
+            // Every frame of this call runs code that the interpreter run recorded, so the JIT
+            // never falls back to the interpreter.
+            jit.set_interpreter_runner(FixedJitRunner { functions: Arc::clone(functions) });
             let jit_cost = self.time(counters, || jit.transact(&tx).map(|r| drop(r.discard())))?;
-            misses.store(0, Ordering::Relaxed);
             let jres = jit.transact(&tx)?.commit();
-            eyre::ensure!(
-                misses.load(Ordering::Relaxed) == 0,
-                "{} {}: JIT fell back to the interpreter",
-                case.test_id,
-                call.label
-            );
             check_same(&ires, &jres)
                 .map_err(|e| eyre::eyre!("{} {}: {e}", case.test_id, call.label))?;
             if ires.tx_gas_used() != call.gas {
@@ -228,7 +213,6 @@ impl BundleArgs {
                 *s += c;
             }
             if let Some(out) = out.as_mut() {
-                use std::io::Write;
                 let line = serde_json::json!({
                     "variant": case.variant,
                     "test_id": case.test_id,
@@ -256,7 +240,7 @@ impl BundleArgs {
         f().map_err(|e| eyre::eyre!("{e:?}"))?;
         let (c, _) = counters.measure(|| f().unwrap());
         let reps = (self.batch_cycles / c.max(1)).clamp(1, 10_000);
-        let mut samples = Vec::with_capacity(self.batches);
+        let mut samples = Vec::with_capacity(self.batches as usize);
         for _ in 0..self.batches {
             let (c, i) = counters.measure(|| {
                 for _ in 0..reps {
@@ -324,28 +308,6 @@ impl InterpreterRunner<BaseEvmTypes> for Recorder {
     }
 }
 
-/// Runs frames with precompiled functions and counts frames it has no function for.
-#[derive(Clone, Debug)]
-struct JitRunner {
-    functions: Arc<HashMap<B256, EvmCompilerFn>>,
-    misses: Arc<AtomicU64>,
-}
-
-impl InterpreterRunner<BaseEvmTypes> for JitRunner {
-    fn run<'frame, 'host>(
-        &self,
-        interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
-        host: &mut Evm<'host, BaseEvmTypes>,
-    ) -> Option<InstrStop> {
-        let Some(func) = self.functions.get(&interpreter.original_bytecode_hash()) else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        interpreter.prepare_run(host);
-        Some(unsafe { func.call_with_interpreter(interpreter) })
-    }
-}
-
 /// User-mode cycle and instruction counters for the calling thread.
 struct Counters {
     cycles: i32,
@@ -374,12 +336,12 @@ impl Counters {
 
 /// Opens a user-mode hardware counter (`PERF_TYPE_HARDWARE`) for the calling thread.
 fn perf_counter(config: u64) -> eyre::Result<i32> {
-    // `perf_event_attr`, version 8 (136 bytes): type and size, config, then flags at word 6.
+    // `perf_event_attr`, version 8 (136 bytes): type and size, config, then flags at word 5.
     let mut attr = [0u64; 17];
     attr[0] = (136u64) << 32;
     attr[1] = config;
     // exclude_kernel | exclude_hv
-    attr[6] = (1 << 5) | (1 << 6);
+    attr[5] = (1 << 5) | (1 << 6);
     let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
     eyre::ensure!(fd >= 0, "perf_event_open failed: {}", std::io::Error::last_os_error());
     Ok(fd as i32)

@@ -180,3 +180,23 @@ def perf_counts(binary: str, args: list[str]) -> tuple[int, int]:
                 except ValueError:
                     pass
     return int(stats["instructions:u"]), int(stats["cycles:u"])
+
+
+DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ns|µs|us|ms|s)")
+DURATION_UNITS = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}
+
+
+def parse_duration(s: str) -> float:
+    """Parse a Rust-style Duration debug string to seconds."""
+    m = DURATION_RE.search(s)
+    if not m:
+        return 0.0
+    return float(m.group(1)) * DURATION_UNITS[m.group(2)]
+
+
+def total_iters(n: int) -> int:
+    """`evm2 run <bench> N` runs `max(N / 10, 10)` warmup iterations before the timed ones.
+
+    Keep in sync with `bench` in `crates/cli/src/run.rs`.
+    """
+    return n + max(n // 10, 10)

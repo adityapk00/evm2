@@ -49,7 +49,6 @@ zstd.workspace = true
 evm2-jit-context = { workspace = true, optional = true }
 evm2-jit-llvm = { workspace = true, optional = true }
 evm2-jit-runtime = { workspace = true, features = ["llvm"], optional = true }
-libc = { workspace = true, optional = true }
 libloading = { version = "0.9", optional = true }
 open = { version = "5", optional = true }
 
@@ -59,6 +58,10 @@ mimalloc = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 # jemalloc
 tikv-jemallocator = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# jit
+libc = { workspace = true, optional = true }
 
 [build-dependencies]
 evm2-jit-build = { workspace = true, optional = true }
