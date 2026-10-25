@@ -37,14 +37,15 @@ fn run_state<'a, 'frame, 'host, T: EvmTypesHost>(
 }
 
 #[inline(always)]
-const fn inc_pc(pc: &mut Pc, op: u8) {
-    unsafe { pc.advance_unchecked(instruction_len(op)) };
+const fn inc_pc<T: EvmTypesHost, M: InspectMode<T>>(pc: &mut Pc, op: u8) {
+    unsafe { pc.advance_unchecked(instruction_len::<T, M>(op)) };
 }
 
 #[inline(always)]
-const fn instruction_len(op: u8) -> usize {
+const fn instruction_len<T: EvmTypesHost, M: InspectMode<T>>(op: u8) -> usize {
     match op {
-        op::JUMP | op::JUMPI | fused::FIRST..=fused::LAST => 0, // Set inside.
+        op::JUMP | op::JUMPI => 0, // Set inside.
+        fused::FIRST..=fused::LAST if M::FUSED => 0,
         op::PUSH1..=op::PUSH32 => (op - op::PUSH1 + 2) as usize,
         op::DUPN | op::SWAPN | op::EXCHANGE => 2,
         _ => 1,

@@ -105,7 +105,7 @@ extern_table! {
             }
             tail_return!(tail_call_restore(pc, stack, remaining_gas, state, instructions));
         }
-        super::inc_pc(&mut pc, OP);
+        super::inc_pc::<T, M>(&mut pc, OP);
         if M::INSPECT {
             M::step_end(state, pc, stack.len());
             remaining_gas.set(state.gas_mut().remaining());

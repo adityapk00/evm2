@@ -80,27 +80,25 @@ pub(crate) const fn unfused_op(opcode: u8) -> Option<u8> {
     }
 }
 
-/// Returns whether config `C` can run fused bytecode: every reserved byte must be unknown, and
-/// every opcode in a sequence must keep its base implementation.
+/// Returns whether config `C` can run fused bytecode.
+///
+/// Translation assumes the base instructions and their immediates, so every opcode must keep its
+/// base implementation and static gas, and every reserved byte must be unknown.
 pub(crate) const fn is_enabled<T: EvmTypesHost, C: EvmConfig<T>>() -> bool {
     let config = C::OPCODE_CONFIG;
     let base = &OpcodeConfig::<T>::base::<C>();
-    let mut opcode = UNKNOWN;
-    while opcode <= LAST {
-        if !config.is_unknown_opcode(opcode) {
+    let mut opcode = 0;
+    loop {
+        if config.revision(opcode) != base.revision(opcode)
+            || (UNKNOWN <= opcode && opcode <= LAST && !config.is_unknown_opcode(opcode))
+        {
             return false;
         }
-        let sequence = sequence(opcode);
-        let mut i = 0;
-        while i < sequence.len() {
-            if config.revision(sequence[i]) != base.revision(sequence[i]) {
-                return false;
-            }
-            i += 1;
+        if opcode == u8::MAX {
+            return true;
         }
         opcode += 1;
     }
-    true
 }
 
 /// Returns the opcode config of `C` extended with the synthetic opcodes.
@@ -233,6 +231,7 @@ fn read_target<const N: usize>(pc: &Pc, offset: usize) -> usize {
 fn push_jump<const N: usize>(cx: _) -> Result {
     check_len(&stack, 0, STACK_LIMIT - 1)?;
     let target = read_target::<N>(cx.pc, 1);
+    debug_assert!(cx.state.bytecode().is_valid_jumpdest(target));
     unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target + 1) };
     Ok(())
 }
@@ -244,6 +243,7 @@ fn push_jumpi<const N: usize>(cx: _) -> Result {
         unsafe { cx.pc.advance_unchecked(N + 2) };
     } else {
         let target = read_target::<N>(cx.pc, 1);
+        debug_assert!(cx.state.bytecode().is_valid_jumpdest(target));
         unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target) };
     }
     unsafe { stack.pop_unchecked() };
@@ -255,6 +255,7 @@ fn iszero_push2_jumpi(cx: _) -> Result {
     check_len(&stack, 1, STACK_LIMIT - 1)?;
     if unsafe { stack.top_unchecked() }.is_zero() {
         let target = read_target::<2>(cx.pc, 2);
+        debug_assert!(cx.state.bytecode().is_valid_jumpdest(target));
         unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target) };
     } else {
         unsafe { cx.pc.advance_unchecked(5) };
@@ -295,8 +296,8 @@ fn push1_add(cx: _) -> Result {
 mod tests {
     use super::*;
     use crate::{
-        SpecId,
-        test_utils::{RunConfig, TestInterpreter, run},
+        BaseEvmConfigSelector, ExecutionConfig, SpecId,
+        test_utils::{RunConfig, TestInterpreter, TestTypes, run},
     };
     use alloc::{format, vec::Vec};
 
@@ -328,6 +329,14 @@ mod tests {
         let mut code = Vec::from_iter((0..n).flat_map(|i| [op::PUSH1, i as u8]));
         code.extend_from_slice(tail);
         code
+    }
+
+    #[test]
+    fn enabled_for_base_specs() {
+        for spec in core::iter::successors(Some(SpecId::MIN), |spec| spec.next()) {
+            let config = ExecutionConfig::<TestTypes>::for_base_spec::<BaseEvmConfigSelector>(spec);
+            assert!(config.fused_instructions.is_some(), "{spec:?}");
+        }
     }
 
     #[test]
