@@ -73,10 +73,10 @@ struct BytecodeInner {
     jump_table: OnceLock<JumpTable>,
     /// Bytecode translated for fused execution, with the same layout as `bytecode`.
     fused: OnceLock<Box<[u8]>>,
-    /// Gas that frames spent running this bytecode before it was translated.
-    unfused_gas: AtomicUsize,
     /// Cached hash of the original bytecode.
     hash: OnceLock<B256>,
+    /// Gas that frames spent running this bytecode before it was translated.
+    unfused_gas: AtomicUsize,
 }
 
 /// The kind of bytecode.
@@ -364,7 +364,9 @@ impl Bytecode {
     #[inline]
     pub(crate) fn record_unfused_gas(&self, gas: u64) {
         if let Some(inner) = &self.0 {
-            inner.unfused_gas.fetch_add(gas as usize, atomic::Ordering::Relaxed);
+            // A racing update may be lost, which only delays translation.
+            let total = inner.unfused_gas.load(atomic::Ordering::Relaxed);
+            inner.unfused_gas.store(total.wrapping_add(gas as usize), atomic::Ordering::Relaxed);
         }
     }
 

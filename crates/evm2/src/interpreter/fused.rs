@@ -21,7 +21,7 @@ use crate::{
     EvmConfig, EvmTypesHost, OpcodeConfig,
     bytecode::JumpTable,
     constants::STACK_LIMIT,
-    interpreter::{InstrStop, StackMut, Word, op},
+    interpreter::{InstrStop, Pc, StackMut, Word, op},
     utils::WordExt,
 };
 use alloc::boxed::Box;
@@ -107,20 +107,20 @@ pub(crate) const fn is_enabled<T: EvmTypesHost, C: EvmConfig<T>>() -> bool {
 pub(crate) const fn opcode_config<T: EvmTypesHost, C: EvmConfig<T>>() -> OpcodeConfig<T> {
     let mut config = C::OPCODE_CONFIG.const_clone();
     macro_rules! set {
-        ($($opcode:ident => $instr:ident,)*) => {$(
-            config.set_instruction::<$instr<T>>($opcode, static_gas::<T, C>($opcode));
+        ($($opcode:ident => $instr:ty,)*) => {$(
+            config.set_instruction::<$instr>($opcode, static_gas::<T, C>($opcode));
         )*};
     }
     set! {
-        PUSH2_JUMP => push2_jump,
-        PUSH2_JUMPI => push2_jumpi,
-        ISZERO_PUSH2_JUMPI => iszero_push2_jumpi,
-        PUSH1_JUMP => push1_jump,
-        PUSH1_JUMPI => push1_jumpi,
-        POP_POP => pop_pop,
-        SWAP1_POP => swap1_pop,
-        SWAP2_POP => swap2_pop,
-        PUSH1_ADD => push1_add,
+        PUSH2_JUMP => push_jump<T, 2>,
+        PUSH2_JUMPI => push_jumpi<T, 2>,
+        ISZERO_PUSH2_JUMPI => iszero_push2_jumpi<T>,
+        PUSH1_JUMP => push_jump<T, 1>,
+        PUSH1_JUMPI => push_jumpi<T, 1>,
+        POP_POP => pop_pop<T>,
+        SWAP1_POP => swap_pop<T, 1>,
+        SWAP2_POP => swap_pop<T, 2>,
+        PUSH1_ADD => push1_add<T>,
     }
     config
 }
@@ -203,22 +203,16 @@ const fn instruction_len(opcode: u8) -> usize {
     }
 }
 
-/// Fails like `PUSH` on a full stack.
+/// Checks that the stack holds `min..=max` words, failing like the unfused sequence otherwise.
+///
+/// A sequence underflows below `min` and overflows above `max`, and no length does both, so the
+/// order of the sequence's own checks does not matter.
 #[inline(always)]
-const fn push_check(stack: &StackMut<'_>) -> crate::interpreter::Result {
-    if stack.len() == STACK_LIMIT {
+const fn check_len(stack: &StackMut<'_>, min: usize, max: usize) -> crate::interpreter::Result {
+    let len = stack.len();
+    if len.wrapping_sub(min) > max - min {
         cold_path();
-        return Err(InstrStop::StackOverflow);
-    }
-    Ok(())
-}
-
-/// Fails like an instruction that needs `n` stack inputs.
-#[inline(always)]
-const fn input_check(stack: &StackMut<'_>, n: usize) -> crate::interpreter::Result {
-    if stack.len() < n {
-        cold_path();
-        return Err(InstrStop::StackUnderflow);
+        return Err(if len < min { InstrStop::StackUnderflow } else { InstrStop::StackOverflow });
     }
     Ok(())
 }
@@ -228,95 +222,67 @@ const fn read_u16(bytes: &[u8]) -> usize {
     u16::from_be_bytes([bytes[0], bytes[1]]) as usize
 }
 
+/// Reads the big-endian `PUSH<N>` immediate at `pc + offset` as a jump target.
+#[inline(always)]
+fn read_target<const N: usize>(pc: &Pc, offset: usize) -> usize {
+    let bytes = unsafe { pc.read_bytes_offset_unchecked(offset, N) };
+    bytes.iter().fold(0, |target, &byte| (target << 8) | byte as usize)
+}
+
 #[instruction(no_stack_preamble)]
-fn push2_jump(cx: _) -> Result {
-    push_check(&stack)?;
-    let target = read_u16(unsafe { cx.pc.read_bytes_offset_unchecked(1, 2) });
+fn push_jump<const N: usize>(cx: _) -> Result {
+    check_len(&stack, 0, STACK_LIMIT - 1)?;
+    let target = read_target::<N>(cx.pc, 1);
     unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target + 1) };
     Ok(())
 }
 
 #[instruction(no_stack_preamble)]
-fn push1_jump(cx: _) -> Result {
-    push_check(&stack)?;
-    let target = unsafe { cx.pc.read_bytes_offset_unchecked(1, 1)[0] } as usize;
-    unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target + 1) };
-    Ok(())
-}
-
-#[instruction(no_stack_preamble)]
-fn push2_jumpi(cx: _) -> Result {
-    push_check(&stack)?;
-    input_check(&stack, 1)?;
-    let cond = unsafe { stack.pop_unchecked() };
-    if cond.is_zero() {
-        unsafe { cx.pc.advance_unchecked(4) };
+fn push_jumpi<const N: usize>(cx: _) -> Result {
+    check_len(&stack, 1, STACK_LIMIT - 1)?;
+    if unsafe { stack.top_unchecked() }.is_zero() {
+        unsafe { cx.pc.advance_unchecked(N + 2) };
     } else {
-        let target = read_u16(unsafe { cx.pc.read_bytes_offset_unchecked(1, 2) });
+        let target = read_target::<N>(cx.pc, 1);
         unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target) };
     }
-    Ok(())
-}
-
-#[instruction(no_stack_preamble)]
-fn push1_jumpi(cx: _) -> Result {
-    push_check(&stack)?;
-    input_check(&stack, 1)?;
-    let cond = unsafe { stack.pop_unchecked() };
-    if cond.is_zero() {
-        unsafe { cx.pc.advance_unchecked(3) };
-    } else {
-        let target = unsafe { cx.pc.read_bytes_offset_unchecked(1, 1)[0] } as usize;
-        unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target) };
-    }
+    unsafe { stack.pop_unchecked() };
     Ok(())
 }
 
 #[instruction(no_stack_preamble)]
 fn iszero_push2_jumpi(cx: _) -> Result {
-    input_check(&stack, 1)?;
-    push_check(&stack)?;
-    let cond = unsafe { stack.pop_unchecked() };
-    if cond.is_zero() {
-        let target = read_u16(unsafe { cx.pc.read_bytes_offset_unchecked(2, 2) });
+    check_len(&stack, 1, STACK_LIMIT - 1)?;
+    if unsafe { stack.top_unchecked() }.is_zero() {
+        let target = read_target::<2>(cx.pc, 2);
         unsafe { cx.pc.set_unchecked(cx.state.bytecode(), target) };
     } else {
         unsafe { cx.pc.advance_unchecked(5) };
     }
+    unsafe { stack.pop_unchecked() };
     Ok(())
 }
 
 #[instruction(no_stack_preamble)]
 fn pop_pop(cx: _) -> Result {
-    input_check(&stack, 2)?;
-    unsafe { stack.popn_unchecked::<2>() };
+    stack.popn::<2>()?;
     unsafe { cx.pc.advance_unchecked(2) };
     Ok(())
 }
 
 #[instruction(no_stack_preamble)]
-fn swap1_pop(cx: _) -> Result {
-    input_check(&stack, 2)?;
-    let top = unsafe { stack.pop_unchecked() };
-    unsafe { *stack.top_unchecked() = top };
-    unsafe { cx.pc.advance_unchecked(2) };
-    Ok(())
-}
-
-#[instruction(no_stack_preamble)]
-fn swap2_pop(cx: _) -> Result {
-    input_check(&stack, 3)?;
+fn swap_pop<const N: usize>(cx: _) -> Result {
+    check_len(&stack, N + 1, STACK_LIMIT)?;
     let top = unsafe { stack.pop_unchecked() };
     let len = stack.len();
-    stack.as_slice_mut()[len - 2] = top;
+    stack.as_slice_mut()[len - N] = top;
     unsafe { cx.pc.advance_unchecked(2) };
     Ok(())
 }
 
 #[instruction(no_stack_preamble)]
 fn push1_add(cx: _) -> Result {
-    push_check(&stack)?;
-    input_check(&stack, 1)?;
+    check_len(&stack, 1, STACK_LIMIT - 1)?;
     let x = unsafe { cx.pc.read_bytes_offset_unchecked(1, 1)[0] };
     let top = unsafe { stack.top_unchecked() };
     let sum = top.wrapping_add(Word::from(x));
@@ -332,7 +298,7 @@ mod tests {
         SpecId,
         test_utils::{RunConfig, TestInterpreter, run},
     };
-    use alloc::vec::Vec;
+    use alloc::{format, vec::Vec};
 
     fn run_both(code: &[u8], spec: SpecId, gas_limit: u64) -> (TestInterpreter, TestInterpreter) {
         let config = || RunConfig::new(code).spec(spec).gas_limit(gas_limit);

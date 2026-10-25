@@ -132,18 +132,7 @@ where
     if !fused::is_enabled::<T, C>() {
         return None;
     }
-    let mut table = *base;
-    macro_rules! assign {
-        ($($op:ident,)*) => {$(
-            table[fused::$op as usize] =
-                imp::dispatch::<T, FusedConfig<C>, NoInspector, { fused::$op }> as imp::RawInstrFn<T>;
-        )*};
-    }
-    assign! {
-        PUSH2_JUMP, PUSH2_JUMPI, ISZERO_PUSH2_JUMPI, PUSH1_JUMP, PUSH1_JUMPI, POP_POP, SWAP1_POP,
-        SWAP2_POP, PUSH1_ADD,
-    }
-    Some(table)
+    Some(make_table::<T, FusedConfig<C>, Fused>(Some(base), Some(C::OPCODE_CONFIG)))
 }
 
 /// `C` with the synthetic opcodes of fused bytecode.
@@ -275,6 +264,9 @@ const fn instruction_changed<T: EvmTypesHost>(
 trait InspectMode<T: EvmTypesHost> {
     const INSPECT: bool;
 
+    /// Whether this mode dispatches the synthetic opcodes of fused bytecode.
+    const FUSED: bool = false;
+
     fn step(state: &mut InterpreterState<'_, '_, T>, pc: Pc, stack_len: usize);
 
     fn step_end(state: &mut InterpreterState<'_, '_, T>, pc: Pc, stack_len: usize);
@@ -284,6 +276,20 @@ struct NoInspector;
 
 impl<T: EvmTypesHost> InspectMode<T> for NoInspector {
     const INSPECT: bool = false;
+
+    #[inline(always)]
+    fn step(_state: &mut InterpreterState<'_, '_, T>, _pc: Pc, _stack_len: usize) {}
+
+    #[inline(always)]
+    fn step_end(_state: &mut InterpreterState<'_, '_, T>, _pc: Pc, _stack_len: usize) {}
+}
+
+/// Uninspected dispatch of the synthetic opcodes of fused bytecode.
+struct Fused;
+
+impl<T: EvmTypesHost> InspectMode<T> for Fused {
+    const INSPECT: bool = false;
+    const FUSED: bool = true;
 
     #[inline(always)]
     fn step(_state: &mut InterpreterState<'_, '_, T>, _pc: Pc, _stack_len: usize) {}

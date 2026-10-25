@@ -22,12 +22,11 @@ impl<'a> BytecodeRef<'a> {
         }
     }
 
-    /// Creates a view of the fused translation of `bytecode`, if it has one.
-    pub(crate) fn new_fused(bytecode: &'a Bytecode) -> Option<Self> {
-        Some(Self {
-            base: NonNull::from(bytecode.fused_bytes()?).cast(),
-            jump_table: bytecode.jump_table().as_ref(),
-        })
+    /// Points the view at `base`, another buffer with the same layout.
+    #[inline]
+    pub(crate) const fn set_base(&mut self, base: *const u8) {
+        // SAFETY: `base` points into a live bytecode allocation.
+        self.base = unsafe { NonNull::new_unchecked(base.cast_mut()) };
     }
 
     /// Returns a pointer to the start of the bytecode.

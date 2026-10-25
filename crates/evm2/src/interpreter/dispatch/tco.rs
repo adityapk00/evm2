@@ -65,10 +65,11 @@ extern_table! {
         }
         if let Err(e) = pre_step::<T, C>(&mut remaining_gas, OP) {
             cold_path();
-            if let Some(op) = fused::unfused_op(OP) {
+            if M::FUSED
+                && let Some(op) = fused::unfused_op(OP)
+            {
                 // Not enough gas for the whole sequence: run its first opcode alone.
-                let static_gas = C::OPCODE_CONFIG.static_gas(OP) as u64;
-                remaining_gas.set(remaining_gas.get().wrapping_add(static_gas));
+                remaining_gas.unspend(C::OPCODE_CONFIG.static_gas(OP) as u64);
                 // SAFETY: `instructions` is a pointer to a `TailInstrTable`.
                 let instructions_t = unsafe { &*instructions.cast::<TailInstrTable<T>>() };
                 let instr = instructions_t[op as usize];

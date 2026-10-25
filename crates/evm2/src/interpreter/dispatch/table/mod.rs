@@ -132,7 +132,9 @@ fn dispatch_inner<T: EvmTypesHost, C: EvmConfig<T>, M: InspectMode<T>, G: Dispat
             gas.sync_after_exec(state, dynamic_gas);
         }
         Err(e) => {
-            if let Some(first) = fused::unfused_op(op) {
+            if M::FUSED
+                && let Some(first) = fused::unfused_op(op)
+            {
                 // Not enough gas for the whole sequence: run its first opcode alone.
                 cold_path();
                 gas.undo_spend(state, C::OPCODE_CONFIG.static_gas(op) as u64);
