@@ -161,7 +161,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[inline]
     pub fn pc(&self) -> usize {
         // SAFETY: `pc` is always in bounds of the active bytecode view.
-        unsafe { self.pc.offset_from(self.bytecode().as_ptr()) as usize }
+        unsafe { self.pc.offset_from(self.code_base()) as usize }
     }
 
     /// Sets the current bytecode-relative program counter.
@@ -172,13 +172,20 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[inline]
     pub fn set_pc(&mut self, pc: usize) {
         assert!(pc < self.bytecode.bytes_slice().len());
-        self.pc = unsafe { self.bytecode().as_ptr().add(pc) };
+        self.pc = unsafe { self.code_base().add(pc) };
+    }
+
+    /// Returns the start of the active bytecode buffer without analyzing jump destinations.
+    #[inline]
+    fn code_base(&self) -> *const u8 {
+        self.bytecode_ref.map_or_else(|| self.bytecode.bytes_slice().as_ptr(), |view| view.as_ptr())
     }
 
     /// Returns the current opcode.
-    #[inline]
     ///
     /// Inspected runs execute the original bytecode, so inspectors always see original opcodes.
+    /// After an uninspected run of fused bytecode, this may return a synthetic opcode.
+    #[inline]
     pub const fn opcode(&self) -> u8 {
         // SAFETY: `pc` is always in bounds of `bytecode`.
         unsafe { *self.pc }

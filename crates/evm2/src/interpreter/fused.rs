@@ -137,6 +137,7 @@ const fn static_gas<T: EvmTypesHost, C: EvmConfig<T>>(fused: u8) -> u16 {
 /// Translates legacy bytecode into its fused form.
 pub(crate) fn fuse(code: &[u8], jump_table: &JumpTable) -> Box<[u8]> {
     let mut out = Box::<[u8]>::from(code);
+    let is_jumpdest = |target| jump_table.is_valid(target) && code[target] == op::JUMPDEST;
     // Patterns read up to 4 bytes past their first opcode.
     let end = code.len().saturating_sub(4);
     let mut i = 0;
@@ -144,23 +145,23 @@ pub(crate) fn fuse(code: &[u8], jump_table: &JumpTable) -> Box<[u8]> {
         let opcode = code[i];
         let (fused, len) = match opcode {
             op::PUSH1 => match code[i + 2] {
-                op::JUMP if jump_table.is_valid(code[i + 1] as usize) => (PUSH1_JUMP, 3),
-                op::JUMPI if jump_table.is_valid(code[i + 1] as usize) => (PUSH1_JUMPI, 3),
+                op::JUMP if is_jumpdest(code[i + 1] as usize) => (PUSH1_JUMP, 3),
+                op::JUMPI if is_jumpdest(code[i + 1] as usize) => (PUSH1_JUMPI, 3),
                 op::ADD => (PUSH1_ADD, 3),
                 _ => (opcode, 2),
             },
             op::PUSH2 => {
                 let target = read_u16(&code[i + 1..]);
                 match code[i + 3] {
-                    op::JUMP if jump_table.is_valid(target) => (PUSH2_JUMP, 4),
-                    op::JUMPI if jump_table.is_valid(target) => (PUSH2_JUMPI, 4),
+                    op::JUMP if is_jumpdest(target) => (PUSH2_JUMP, 4),
+                    op::JUMPI if is_jumpdest(target) => (PUSH2_JUMPI, 4),
                     _ => (opcode, 3),
                 }
             }
             op::ISZERO
                 if code[i + 1] == op::PUSH2
                     && code[i + 4] == op::JUMPI
-                    && jump_table.is_valid(read_u16(&code[i + 2..])) =>
+                    && is_jumpdest(read_u16(&code[i + 2..])) =>
             {
                 (ISZERO_PUSH2_JUMPI, 5)
             }
