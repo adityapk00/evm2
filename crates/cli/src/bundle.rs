@@ -72,6 +72,10 @@ impl BundleArgs {
     pub(crate) fn run(self) -> eyre::Result<()> {
         let counters = Counters::new()?;
         let mut compiler = EvmCompiler::new_llvm(false)?;
+        if std::env::var_os("EVM2_BUNDLE_JITDUMP").is_some() {
+            compiler.set_profiling_support(true);
+            compiler.set_debug_info(true);
+        }
         compiler.set_dump_to(self.dump.clone());
         let mut out = self.out.as_ref().map(std::fs::File::create).transpose()?;
         // Compiled code by bytecode hash, shared by all cases.
@@ -136,6 +140,7 @@ impl BundleArgs {
             let mut version = *Version::base(SPEC);
             version.max_code_size = usize::MAX;
             version.max_initcode_size = usize::MAX;
+            version.tx_gas_limit_cap = u64::MAX;
             Evm::<BaseEvmTypes>::new_with_execution_config(
                 ExecutionConfig::for_spec_and_version(SPEC, version),
                 SPEC,
@@ -174,29 +179,42 @@ impl BundleArgs {
             let tx = tx(i as u64 + 1, TxKind::Call(target), call.calldata.clone());
 
             // The committed interpreter run records every executed bytecode for the JIT.
-            let interp_cost =
-                self.time(counters, || interp.transact(&tx).map(|r| drop(r.discard())))?;
+            let interp_cost = if std::env::var_os("EVM2_BUNDLE_JIT_ONLY").is_some() {
+                (0.0, 0.0)
+            } else {
+                self.time(counters, || interp.transact(&tx).map(|r| drop(r.discard())))?
+            };
             interp.set_interpreter_runner(recorder.clone());
             let ires = interp.transact(&tx)?.commit();
             interp.clear_interpreter_runner();
 
-            for (hash, code) in codes.lock().unwrap().iter() {
-                if !functions.contains_key(hash) {
-                    let name =
-                        format!("{}_{}_{}", case.variant, case.test_id, &hash.to_string()[2..10]);
-                    compiler.set_module_name(&name);
-                    let f = unsafe { compiler.jit(&name, code, SPEC)? };
-                    compiler.clear_ir()?;
-                    Arc::make_mut(functions).insert(*hash, f);
+            let jit_cost = if std::env::var_os("EVM2_BUNDLE_INTERP_ONLY").is_some() {
+                (0.0, 0.0)
+            } else {
+                for (hash, code) in codes.lock().unwrap().iter() {
+                    if !functions.contains_key(hash) {
+                        let name = format!(
+                            "{}_{}_{}",
+                            case.variant,
+                            case.test_id,
+                            &hash.to_string()[2..10]
+                        );
+                        compiler.set_module_name(&name);
+                        let f = unsafe { compiler.jit(&name, code, SPEC)? };
+                        compiler.clear_ir()?;
+                        Arc::make_mut(functions).insert(*hash, f);
+                    }
                 }
-            }
-            // Every frame of this call runs code that the interpreter run recorded, so the JIT
-            // never falls back to the interpreter.
-            jit.set_interpreter_runner(FixedJitRunner { functions: Arc::clone(functions) });
-            let jit_cost = self.time(counters, || jit.transact(&tx).map(|r| drop(r.discard())))?;
-            let jres = jit.transact(&tx)?.commit();
-            check_same(&ires, &jres)
-                .map_err(|e| eyre::eyre!("{} {}: {e}", case.test_id, call.label))?;
+                // Every frame of this call runs code that the interpreter run recorded, so the JIT
+                // never falls back to the interpreter.
+                jit.set_interpreter_runner(FixedJitRunner { functions: Arc::clone(functions) });
+                let jit_cost =
+                    self.time(counters, || jit.transact(&tx).map(|r| drop(r.discard())))?;
+                let jres = jit.transact(&tx)?.commit();
+                check_same(&ires, &jres)
+                    .map_err(|e| eyre::eyre!("{} {}: {e}", case.test_id, call.label))?;
+                jit_cost
+            };
             if ires.tx_gas_used() != call.gas {
                 gas_mismatches += 1;
                 eprintln!(
@@ -264,7 +282,7 @@ const fn tx(nonce: u64, to: TxKind, input: Bytes) -> RecoveredTxEnvelope {
         chain_id: None,
         nonce,
         gas_price: 0,
-        gas_limit: Version::base(SPEC).tx_gas_limit_cap,
+        gas_limit: 1 << 32,
         to,
         value: U256::ZERO,
         input,
