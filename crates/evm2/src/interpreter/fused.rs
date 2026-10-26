@@ -298,7 +298,9 @@ mod tests {
     use super::*;
     use crate::{
         BaseEvmConfigSelector, ExecutionConfig, SpecId,
-        test_utils::{RunConfig, TestInterpreter, TestTypes, run},
+        env::TxEnvExt,
+        interpreter::{Interpreter, Message, MessageExt},
+        test_utils::{RunConfig, TestHost, TestInterpreter, TestTypes, legacy_bytecode, run},
     };
     use alloc::{format, vec::Vec};
 
@@ -390,5 +392,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn entry_inside_immediate_is_not_fused() {
+        let code = [op::PUSH3, PUSH2_JUMP, 0xFF, 0xFF, op::STOP];
+        let message = Message::<TestTypes> {
+            code: legacy_bytecode(code),
+            gas_limit: 10_000,
+            ..MessageExt::default()
+        };
+        let tx_env = TxEnvExt::default();
+        let mut interpreter = Interpreter::<TestTypes>::new(&tx_env, &message);
+        interpreter.set_pc(1);
+        let mut host = TestHost {
+            execution_config: ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(
+                SpecId::OSAKA,
+            ),
+            ..TestHost::default()
+        };
+        assert_eq!(interpreter.run(&mut host), Ok(InstrStop::OpcodeNotFound));
     }
 }

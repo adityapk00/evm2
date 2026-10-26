@@ -468,7 +468,10 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             // across setup, which makes the dispatch loop spill the stack pointer.
             // SAFETY: `prepare_run` initialized the host, and the config is only read here.
             let config = unsafe { self.execution_config_detached() };
-            let fusion = config.fused_instructions.filter(|_| inspector.is_none());
+            // Fused bytecode keeps immediates that may hold synthetic opcodes, so only enter it at
+            // the start, where `pc` is known to be on an instruction boundary.
+            let fusion =
+                config.fused_instructions.filter(|_| inspector.is_none() && self.pc() == 0);
             let fused_code = fusion.and_then(|_| self.bytecode.fused_bytes()).map(<[u8]>::as_ptr);
             self.set_code_base(fused_code.unwrap_or(self.bytecode.bytes_slice().as_ptr()));
             self.child_gas_spent = 0;
