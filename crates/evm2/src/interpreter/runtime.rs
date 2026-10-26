@@ -471,6 +471,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             let fusion = config.fused_instructions.filter(|_| inspector.is_none());
             let fused_code = fusion.and_then(|_| self.bytecode.fused_bytes()).map(<[u8]>::as_ptr);
             self.set_code_base(fused_code.unwrap_or(self.bytecode.bytes_slice().as_ptr()));
+            self.child_gas_spent = 0;
             if let Some(instructions) = fusion
                 && fused_code.is_some()
             {
@@ -482,7 +483,6 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
                     config.instructions
                 };
                 let gas = self.gas.remaining();
-                self.child_gas_spent = 0;
                 let stop = dispatch::run(self, instructions);
                 if fusion.is_some() {
                     let spent = gas.saturating_sub(self.gas.remaining());
