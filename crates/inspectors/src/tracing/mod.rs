@@ -730,8 +730,11 @@ impl TracingInspector {
     }
 
     fn record_call_gas_cost<T: EvmTypes>(&mut self, interp: &Interpreter<'_, '_, T>) {
-        if let Some((trace_idx, step_idx)) = self.step_stack.last()
-            && let Some(step) = self.traces.arena[*trace_idx].trace.steps.get_mut(*step_idx)
+        // Only a step of the active trace can start the child. A nested root traced by the same
+        // inspector must not overwrite the cost of the outer CALL step that is still last.
+        if let Some(&(trace_idx, step_idx)) = self.step_stack.last()
+            && self.trace_stack.last().is_some_and(|entry| entry.trace_idx == trace_idx)
+            && let Some(step) = self.traces.arena[trace_idx].trace.steps.get_mut(step_idx)
         {
             // `step_end` runs after child execution. Parity's cost includes forwarded gas,
             // whereas its execution record reports the parent's gas after the child returns.
