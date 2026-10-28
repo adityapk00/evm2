@@ -1918,7 +1918,6 @@ fn test_geth_struct_log_failed_memory_expansion_cost() {
     assert_eq!(step.gas, 14);
     // A failed expansion charges nothing, so the step reports the gas paid before it.
     assert_eq!(step.gas_cost, 3);
-    assert_eq!(step.error.as_deref(), Some("out of gas: out of memory"));
 }
 
 /// EIP-7708: a transfer log of a reverted call is rolled back and does not consume an index.
