@@ -24,7 +24,6 @@ use std::{
 ///
 /// The backend refreshes a key's last-hit time from these reports, so a resident program used by
 /// any thread is reported at least once per this many of that thread's hits.
-
 const HIT_FLUSH_INTERVAL: u64 = 1024;
 
 thread_local! {
@@ -59,7 +58,7 @@ pub struct LocalProgram {
 impl LocalProgram {
     /// Wraps a program that no thread's cache holds.
     pub(crate) fn owned(program: Arc<CompiledProgram>) -> Self {
-        Self { program: NonNull::from(&*program), cache: None, _owned: Some(program) }
+        Self { program: program_ptr(&program), cache: None, _owned: Some(program) }
     }
 
     /// Returns a new reference-counted handle to the program.
@@ -122,6 +121,19 @@ pub(crate) struct LocalCache {
 }
 
 impl LocalCache {
+    /// Creates an empty cache for `backend`.
+    fn new(backend: Weak<BackendShared>) -> Self {
+        Self {
+            backend,
+            programs: HashMap::default(),
+            reported: HashSet::default(),
+            pending_hits: 0,
+            hits_since_clear: 0,
+            borrows: 0,
+            retired: Vec::new(),
+        }
+    }
+
     /// Empties the cache, returning the programs the caller may drop.
     ///
     /// While programs are borrowed, they are kept alive until the last borrow is released.
@@ -156,7 +168,6 @@ impl LocalCache {
         self.pending_hits += 1;
         self.hits_since_clear += 1;
         if self.hits_since_clear >= HIT_FLUSH_INTERVAL {
-            self.flush_hits(shared);
             self.reported.clear();
             self.hits_since_clear = 0;
         }
@@ -164,6 +175,8 @@ impl LocalCache {
             // An empty bytecode marks a hit, which refreshes the key's last-hit time.
             if shared.events.push(LookupRequest { key: *key, code: Bytes::new() }).is_err() {
                 shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                // Report the key again on its next hit.
+                self.reported.remove(key);
             }
             self.flush_hits(shared);
         }
@@ -198,12 +211,12 @@ pub(super) fn get(shared: &Arc<BackendShared>, key: &RuntimeCacheKey) -> Option<
         };
         let mut guard = lock(cache);
         let program = match guard.programs.get(key) {
-            Some(program) => NonNull::from(&**program),
+            Some(program) => program_ptr(program),
             None => {
                 // Read the map under the cache lock, so that a removal either precedes this read
                 // or invalidates the cache after the insert below.
                 let program = Arc::clone(&*shared.resident.try_get(key).try_unwrap()?);
-                let ptr = NonNull::from(&*program);
+                let ptr = program_ptr(&program);
                 guard.programs.insert(*key, program);
                 ptr
             }
@@ -226,15 +239,7 @@ pub(super) fn get(shared: &Arc<BackendShared>, key: &RuntimeCacheKey) -> Option<
 
 /// Creates the calling thread's cache for `shared` and registers it for invalidation.
 fn register(shared: &Arc<BackendShared>) -> Arc<Mutex<LocalCache>> {
-    let cache = Arc::new(Mutex::new(LocalCache {
-        backend: Arc::downgrade(shared),
-        programs: HashMap::default(),
-        reported: HashSet::default(),
-        pending_hits: 0,
-        hits_since_clear: 0,
-        borrows: 0,
-        retired: Vec::new(),
-    }));
+    let cache = Arc::new(Mutex::new(LocalCache::new(Arc::downgrade(shared))));
     let mut caches = lock(&shared.local_caches);
     caches.retain(|cache| cache.strong_count() > 0);
     caches.push(Arc::downgrade(&cache));
@@ -261,6 +266,13 @@ pub(crate) fn invalidate_all(caches: &LocalCaches) {
         drop(programs);
         true
     });
+}
+
+/// Returns a pointer to `program` that keeps the provenance of its whole allocation, which
+/// [`LocalProgram::to_arc`] needs to reach the reference counts.
+fn program_ptr(program: &Arc<CompiledProgram>) -> NonNull<CompiledProgram> {
+    // SAFETY: `Arc::as_ptr` is never null.
+    unsafe { NonNull::new_unchecked(Arc::as_ptr(program).cast_mut()) }
 }
 
 /// Locks `mutex`, ignoring poisoning: the caches stay consistent if a holder panics.
@@ -292,15 +304,7 @@ mod tests {
             pause_depth: AtomicUsize::new(0),
             stats: Arc::new(RuntimeStats::default()),
         });
-        let mut cache = LocalCache {
-            backend: Arc::downgrade(&shared),
-            programs: HashMap::default(),
-            reported: HashSet::default(),
-            pending_hits: 0,
-            hits_since_clear: 0,
-            borrows: 0,
-            retired: Vec::new(),
-        };
+        let mut cache = LocalCache::new(Arc::downgrade(&shared));
 
         // Each first report of a new key adds the pending hits to the stats, which must not stop
         // the hot key's reports from restarting after `HIT_FLUSH_INTERVAL` hits.
