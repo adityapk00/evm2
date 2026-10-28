@@ -208,3 +208,23 @@ fn inspect_bytecode(code: Bytecode, config: TracingInspectorConfig) -> TracingIn
     assert!(result.result.is_success());
     evm.into_inspector()
 }
+
+#[test]
+fn memory_oog_cost_is_gas_paid_before_expansion() {
+    // PUSH1 1, PUSH3 0xffffff, MSTORE: 14 gas remain at MSTORE, which cannot expand memory.
+    let code = hex!("600162ffffff52");
+    let target = Address::with_last_byte(0x42);
+    let mut db = CacheDB::default();
+    db.insert_account_info(
+        &target,
+        AccountInfo::default().with_code(Bytecode::new_raw(code.to_vec().into())),
+    );
+    let traces = trace(
+        db,
+        TxEnv::builder().kind(TransactTo::Call(target)).gas_limit(21_000 + 20).build_fill(),
+    );
+    let mstore = traces.vm_trace.unwrap().ops.pop().unwrap();
+    assert_eq!(mstore.op.as_deref(), Some("MSTORE"));
+    assert_eq!(mstore.cost, 3);
+    assert!(mstore.ex.is_none());
+}
