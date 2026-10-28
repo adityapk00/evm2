@@ -430,8 +430,8 @@ pub const fn validate_floor_gas(gas_limit: u64, floor_gas: u64) -> HandlerResult
 /// Calls and fee-charging transactions consume the nonce before execution. Fee-disabled creates
 /// defer the increment ([`Evm::defers_create_nonce`]) until after the inspector and
 /// value-transfer precheck, so an underfunded create leaves the nonce unchanged. Custom handlers
-/// that disable fees must validate transfer funding or manage the nonce themselves if they commit
-/// underfunded creations.
+/// that disable fees must validate transfer funding if they commit underfunded creations, and must
+/// not bump the nonce of a top-level create themselves: the create path does.
 pub fn validate_sender_and_bump_nonce<'a, T: EvmTypes>(
     host: &mut Evm<'a, T>,
     caller: Address,
@@ -466,8 +466,9 @@ pub fn validate_sender_and_bump_nonce<'a, T: EvmTypes>(
     }
     // The sender is warm from the start of the transaction (EIP-2929).
     sender.warm();
-    sender.touch();
-    if !defers_nonce {
+    if defers_nonce {
+        sender.touch();
+    } else {
         sender.bump_nonce();
     }
     Ok(())

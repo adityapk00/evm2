@@ -168,8 +168,8 @@ evm_features! {
     ///
     /// When disabled, top-level creation consumes the sender nonce only after the value-transfer
     /// funds check, so an insufficient balance leaves the nonce unchanged. Custom handlers
-    /// committing these transactions must validate transfer funding or manage their nonce
-    /// accounting themselves.
+    /// committing these transactions must validate transfer funding, and must not bump the nonce
+    /// of a top-level create themselves.
     ///
     /// Default: on
     FEE_CHARGE,
