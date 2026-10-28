@@ -592,6 +592,36 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.replace_execution_config(execution_config, spec_id, registry, precompiles);
     }
 
+    /// Replaces the block environment and execution configuration within the active
+    /// specification.
+    ///
+    /// Unlike [`Self::set_block_and_execution_config`], this keeps the transaction registry and
+    /// precompile provider, which depend only on the specification, so provider state such as a
+    /// precompile result cache survives. Use it at a segment boundary that stays on one fork but
+    /// changes runtime values in the [`Version`](crate::Version), such as blob or gas caps. Only
+    /// the base specification is checked; the caller must also keep the selector-specific one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an interpreter frame is currently executing or if `execution_config` has a
+    /// different base specification than the active one.
+    #[inline]
+    pub fn set_block_and_execution_config_within_spec(
+        &mut self,
+        block: BlockEnv<T>,
+        execution_config: ExecutionConfig<T>,
+    ) {
+        self.assert_execution_config_mutable();
+        assert_eq!(
+            self.spec_id(),
+            execution_config.base_spec_id(),
+            "execution config spec mismatch"
+        );
+        self.block = block;
+        self.features = execution_config.version().features;
+        self.execution_config = execution_config;
+    }
+
     #[inline]
     fn replace_execution_config(
         &mut self,
@@ -1172,7 +1202,7 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     fn execute_tx(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<TxResult<T>> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
         let guard = self.enter_execution();
-        let result = handler.execute(tx, guard.evm);
+        let result = handler.execute(tx.as_recovered_ref(), guard.evm);
         drop(guard);
         if result.is_err() {
             self.state.clear_transaction_state();
@@ -1198,8 +1228,10 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     ///
     /// Uses the active validation rules; callers must configure any pool-specific relaxations.
     pub fn validate_tx(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<()> {
-        let result =
-            self.registry.try_get_by_type(tx.ty()).and_then(|handler| handler.validate(tx, self));
+        let result = self
+            .registry
+            .try_get_by_type(tx.ty())
+            .and_then(|handler| handler.validate(tx.as_recovered_ref(), self));
         self.state.clear_transaction_state();
         result
     }
@@ -2814,6 +2846,38 @@ mod tests {
         assert!(Arc::ptr_eq(evm.state.bal().unwrap(), &bal));
         assert!(evm.state.bal_builder().is_some());
         assert_eq!(evm.state.bal_index(), BlockAccessIndex::new(67));
+    }
+
+    #[test]
+    fn replacing_execution_config_within_spec_keeps_fork_state() {
+        let mut evm = lifecycle_evm();
+        evm.set_precompiles(precompiles_with([test_precompile(TEST_PRECOMPILE, |_, _, _| {
+            Ok(PrecompileOutput::new(Bytes::new()))
+        })]));
+        let block = BlockEnvExt { number: Word::from(0x71), ..BlockEnvExt::default() };
+        let mut version = Version::new(SpecId::OSAKA);
+        version.max_blobs_per_tx = 21;
+
+        evm.set_block_and_execution_config_within_spec(
+            block,
+            ExecutionConfig::for_spec_and_version(SpecId::OSAKA, version),
+        );
+
+        assert_eq!(evm.block(), &block);
+        assert_eq!(evm.version().max_blobs_per_tx, 21);
+        assert_eq!(evm.config_spec_id(), SpecId::OSAKA);
+        assert!(evm.registry().contains(TEST_TX_TYPE));
+        assert!(evm.precompiles().contains(&TEST_PRECOMPILE));
+    }
+
+    #[test]
+    #[should_panic(expected = "execution config spec mismatch")]
+    fn replacing_execution_config_within_spec_rejects_fork_change() {
+        let mut evm = lifecycle_evm();
+        evm.set_block_and_execution_config_within_spec(
+            BlockEnvExt::default(),
+            ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(SpecId::PRAGUE),
+        );
     }
 
     #[test]
