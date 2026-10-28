@@ -174,7 +174,9 @@ pub struct MessageExt<E = ()> {
     pub call_target: Address,
     /// Immediate caller.
     pub caller: Address,
-    /// Call input data, or initcode for create messages.
+    /// Call input data, or initcode for create messages. A call instruction's message holds a
+    /// range of the caller's memory, which only `Interpreter::input` resolves while the child
+    /// runs.
     pub input: CallInput,
     /// Value transferred with the message.
     pub value: U256,

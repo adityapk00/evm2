@@ -12,8 +12,8 @@ use evm2_inspectors::tracing::{
     FourByteInspector, TraceLimitBehavior, TraceLimits, TracingInspector, TracingInspectorConfig,
 };
 
-/// A single `CALL` passing 64 KiB of memory as calldata, which evm2 copies into a
-/// separate input buffer for the child message.
+/// A single `CALL` passing 64 KiB of memory as calldata, which the child reads in place from
+/// the caller's memory.
 ///
 /// `PUSH0 PUSH0 PUSH3 0x010000 PUSH0 PUSH0 PUSH1 0x43 PUSH2 0xffff CALL STOP`
 const ONE_BIG_CALL: &[u8] = &hex!("5f5f620100005f5f604361fffff100");

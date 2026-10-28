@@ -1244,7 +1244,7 @@ mod tests {
             frame.stack.set(6, EvmWord::from(Word::from(50_000)));
 
             let sp = frame.stack.as_mut_ptr();
-            unsafe { __revmc_builtin_call(&mut frame.ecx, sp, CallKind::Call) };
+            unsafe { abi::__revmc_builtin_call(&mut frame.ecx, sp, CallKind::Call) };
 
             assert_eq!(unsafe { frame.stack.get_unchecked(0) }.to_u256(), Word::from(1));
             assert_eq!(frame.ecx.return_data().as_ref(), b"in");
