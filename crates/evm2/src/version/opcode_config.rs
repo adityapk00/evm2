@@ -63,6 +63,8 @@ impl<T: EvmTypesHost> OpcodeConfig<T> {
                 dynamic_gas: self.instruction_impls.dynamic_gas,
             },
             revisions: self.revisions,
+            instruction_sets: self.instruction_sets,
+            origin: self.origin,
         }
     }
 
