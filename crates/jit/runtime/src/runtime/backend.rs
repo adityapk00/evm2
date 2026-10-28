@@ -1039,7 +1039,7 @@ mod notifier_tests {
     use super::*;
     use crate::runtime::{BackendShared, stats::RuntimeStats};
     use evm2::{SpecId, interpreter::op};
-    use std::time::Duration;
+    use std::{sync::atomic::AtomicUsize, time::Duration};
 
     /// Creates backend state without starting compiler workers.
     fn new_state(tuning: RuntimeTuning) -> BackendState {
@@ -1051,7 +1051,7 @@ mod notifier_tests {
             resident: ResidentMap::default(),
             events: EventQueue::new(config.tuning.channel_capacity),
             local_caches: Default::default(),
-            pause_depth: Default::default(),
+            pause_depth: AtomicUsize::new(0),
             stats: Arc::new(RuntimeStats::default()),
         });
         let (result_tx, result_rx) = chan::unbounded();

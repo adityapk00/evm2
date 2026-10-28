@@ -4,8 +4,8 @@
 //! clones an `Arc`, and reporting the hit pushes to a shared queue: each writes a cache line that
 //! bounces between last-level caches when threads on several of them execute blocks. Instead,
 //! each thread keeps the programs it hit in a cache that only it and the backend thread lock, and
-//! reports hits to the backend in deduplicated batches. The backend invalidates every cache when it
-//! removes or replaces a resident program.
+//! reports hits to the backend in deduplicated batches. The backend invalidates a key in every
+//! cache when it removes or replaces that program, and every key when it clears them all.
 
 use crate::runtime::{BackendShared, CompiledProgram, LookupRequest, RuntimeCacheKey};
 use alloy_primitives::{
@@ -24,6 +24,7 @@ use std::{
 ///
 /// The backend refreshes a key's last-hit time from these reports, so a resident program used by
 /// any thread is reported at least once per this many of that thread's hits.
+
 const HIT_FLUSH_INTERVAL: u64 = 1024;
 
 thread_local! {
@@ -112,6 +113,8 @@ pub(crate) struct LocalCache {
     reported: HashSet<RuntimeCacheKey>,
     /// Hits not yet added to the backend's stats.
     pending_hits: u64,
+    /// Hits since `reported` was last cleared.
+    hits_since_clear: u64,
     /// Number of live [`LocalProgram`]s borrowed from this cache.
     borrows: usize,
     /// Programs dropped from the cache while a [`LocalProgram`] may still run them.
@@ -133,18 +136,36 @@ impl LocalCache {
         }
     }
 
-    /// Counts a hit and reports `key` to the backend if it was not reported since the last flush.
+    /// Drops `key` from the cache, returning the program if the caller may drop it.
+    ///
+    /// While programs are borrowed, the program is kept alive until the last borrow is released.
+    fn invalidate_key(&mut self, key: &RuntimeCacheKey) -> Option<Arc<CompiledProgram>> {
+        self.reported.remove(key);
+        let program = self.programs.remove(key)?;
+        if self.borrows > 0 {
+            self.retired.push(program);
+            None
+        } else {
+            Some(program)
+        }
+    }
+
+    /// Counts a hit and reports `key` to the backend if it was not reported since `reported` was
+    /// last cleared, which happens every [`HIT_FLUSH_INTERVAL`] hits.
     fn record_hit(&mut self, shared: &BackendShared, key: &RuntimeCacheKey) {
         self.pending_hits += 1;
+        self.hits_since_clear += 1;
+        if self.hits_since_clear >= HIT_FLUSH_INTERVAL {
+            self.flush_hits(shared);
+            self.reported.clear();
+            self.hits_since_clear = 0;
+        }
         if self.reported.insert(*key) {
             // An empty bytecode marks a hit, which refreshes the key's last-hit time.
             if shared.events.push(LookupRequest { key: *key, code: Bytes::new() }).is_err() {
                 shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             }
             self.flush_hits(shared);
-        } else if self.pending_hits >= HIT_FLUSH_INTERVAL {
-            self.flush_hits(shared);
-            self.reported.clear();
         }
     }
 
@@ -210,6 +231,7 @@ fn register(shared: &Arc<BackendShared>) -> Arc<Mutex<LocalCache>> {
         programs: HashMap::default(),
         reported: HashSet::default(),
         pending_hits: 0,
+        hits_since_clear: 0,
         borrows: 0,
         retired: Vec::new(),
     }));
@@ -219,7 +241,18 @@ fn register(shared: &Arc<BackendShared>) -> Arc<Mutex<LocalCache>> {
     cache
 }
 
-/// Invalidates every thread's cache of `caches`.
+/// Invalidates `key` in every thread's cache of `caches`.
+pub(crate) fn invalidate_key(caches: &LocalCaches, key: &RuntimeCacheKey) {
+    lock(caches).retain(|cache| {
+        let Some(cache) = cache.upgrade() else { return false };
+        // Free the code outside the lock, which the thread takes on every lookup.
+        let program = lock(&cache).invalidate_key(key);
+        drop(program);
+        true
+    });
+}
+
+/// Invalidates every key in every thread's cache of `caches`.
 pub(crate) fn invalidate_all(caches: &LocalCaches) {
     lock(caches).retain(|cache| {
         let Some(cache) = cache.upgrade() else { return false };
@@ -233,4 +266,54 @@ pub(crate) fn invalidate_all(caches: &LocalCaches) {
 /// Locks `mutex`, ignoring poisoning: the caches stay consistent if a holder panics.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{ResidentMap, backend::EventQueue, stats::RuntimeStats};
+    use alloy_primitives::B256;
+    use evm2::SpecId;
+    use std::sync::atomic::AtomicUsize;
+
+    fn key(n: u64) -> RuntimeCacheKey {
+        RuntimeCacheKey {
+            code_hash: B256::left_padding_from(&n.to_be_bytes()),
+            spec_id: SpecId::CANCUN,
+        }
+    }
+
+    #[test]
+    fn hot_key_is_reported_again_while_new_keys_arrive() {
+        let shared = Arc::new(BackendShared {
+            resident: ResidentMap::default(),
+            events: EventQueue::new(16 * HIT_FLUSH_INTERVAL as usize),
+            local_caches: Default::default(),
+            pause_depth: AtomicUsize::new(0),
+            stats: Arc::new(RuntimeStats::default()),
+        });
+        let mut cache = LocalCache {
+            backend: Arc::downgrade(&shared),
+            programs: HashMap::default(),
+            reported: HashSet::default(),
+            pending_hits: 0,
+            hits_since_clear: 0,
+            borrows: 0,
+            retired: Vec::new(),
+        };
+
+        // Each first report of a new key adds the pending hits to the stats, which must not stop
+        // the hot key's reports from restarting after `HIT_FLUSH_INTERVAL` hits.
+        let hot = key(0);
+        for n in 1..=2 * HIT_FLUSH_INTERVAL {
+            cache.record_hit(&shared, &hot);
+            cache.record_hit(&shared, &key(n));
+        }
+
+        let mut hot_reports = 0;
+        while let Some(event) = shared.events.pop() {
+            hot_reports += usize::from(event.key == hot);
+        }
+        assert!(hot_reports >= 2, "hot key reported {hot_reports} times");
+    }
 }

@@ -81,7 +81,7 @@ mod tests {
     };
 
     #[cfg(feature = "llvm")]
-    use crate::runtime::RuntimeConfig;
+    use crate::runtime::{LookupDecision, LookupRequest, RuntimeConfig};
     #[cfg(feature = "llvm")]
     use alloy_primitives::{Address, hex};
     #[cfg(feature = "llvm")]

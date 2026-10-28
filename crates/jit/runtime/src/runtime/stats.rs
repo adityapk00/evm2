@@ -1,22 +1,18 @@
 //! Runtime statistics.
 
-use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Atomic counters for runtime observability.
-///
-/// Counters that lookup callers write are padded to their own cache lines, so that callers on
-/// different last-level caches do not contend on one line with each other or the backend thread.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeStats {
     /// Total lookups that returned a compiled function.
-    pub(crate) lookup_hits: CachePadded<AtomicU64>,
+    pub(crate) lookup_hits: AtomicU64,
     /// Total lookups that returned interpret (not ready).
-    pub(crate) lookup_misses: CachePadded<AtomicU64>,
+    pub(crate) lookup_misses: AtomicU64,
     /// Total lookup events dropped due to event-queue overflow.
-    pub(crate) events_dropped: CachePadded<AtomicU64>,
+    pub(crate) events_dropped: AtomicU64,
     /// Total control commands dropped because the command channel was full.
-    pub(crate) commands_dropped: CachePadded<AtomicU64>,
+    pub(crate) commands_dropped: AtomicU64,
     /// Total number of entries evicted (idle + budget).
     pub(crate) evictions: AtomicU64,
     /// Total number of compilations dispatched (JIT promotions + AOT requests).
@@ -61,6 +57,9 @@ pub(crate) struct RuntimeStatsGauges {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuntimeStatsSnapshot {
     /// Total lookups that returned a compiled function.
+    ///
+    /// Callers add hits in per-thread batches, so a snapshot can lag by up to
+    /// `HIT_FLUSH_INTERVAL - 1` (1023) hits per thread.
     pub lookup_hits: u64,
     /// Total lookups that returned interpret (not ready).
     pub lookup_misses: u64,

@@ -15,7 +15,6 @@ use api::LoadedLibrary;
 use backend::{Command, CompileJitRequest, EventQueue, PrepareAotRequest, ResidentMap};
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
-use crossbeam_utils::CachePadded;
 use evm2::SpecId;
 use stats::RuntimeStats;
 use std::{
@@ -38,9 +37,6 @@ mod config;
 pub use config::{
     CompilationEvent, CompilationKind, HostConfig, JitMode, RuntimeConfig, RuntimeTuning,
 };
-
-#[cfg(target_os = "linux")]
-mod affinity;
 
 mod backend;
 
@@ -103,9 +99,7 @@ pub(crate) struct BackendShared {
     #[debug(skip)]
     local_caches: local::LocalCaches,
     /// Number of active out-of-process helper pauses.
-    ///
-    /// Padded so that pausing and resuming does not contend with lookups on neighboring fields.
-    pause_depth: CachePadded<AtomicUsize>,
+    pause_depth: AtomicUsize,
     /// Shared stats counters.
     #[debug(skip)]
     stats: Arc<RuntimeStats>,
@@ -215,7 +209,7 @@ impl JitBackend {
             resident: ResidentMap::default(),
             events,
             local_caches: Default::default(),
-            pause_depth: CachePadded::new(AtomicUsize::new(0)),
+            pause_depth: AtomicUsize::new(0),
             stats: Arc::new(RuntimeStats::default()),
         });
         let this = Self {
@@ -651,18 +645,10 @@ impl JitBackend {
         let shared = Arc::clone(&self.inner.shared);
         let backend_rx = rx.clone();
         let backend_config = config.clone();
-        #[cfg(target_os = "linux")]
-        let cpus =
-            config.tuning.jit_avoid_caller_llc.then(affinity::cpus_outside_current_llc).flatten();
 
         let thread = match builder
             .name(config.thread_name.clone())
             .spawn(move || {
-                // Compile workers and helper processes inherit the backend thread's CPUs.
-                #[cfg(target_os = "linux")]
-                if let Some(cpus) = &cpus {
-                    affinity::set_current_thread(cpus);
-                }
                 let result = backend::run(shared, backend_rx, backend_config);
                 let _ = done_tx.send(());
                 result
@@ -794,7 +780,7 @@ impl BackendShared {
     /// Inserts a resident program, replacing any program under `key`.
     pub(crate) fn insert_resident(&self, key: RuntimeCacheKey, program: Arc<CompiledProgram>) {
         if self.resident.insert(key, program).is_some() {
-            local::invalidate_all(&self.local_caches);
+            local::invalidate_key(&self.local_caches, &key);
         }
     }
 
@@ -803,7 +789,7 @@ impl BackendShared {
     /// Threads release their cached copies before this returns, unless they are running it.
     pub(crate) fn remove_resident(&self, key: &RuntimeCacheKey) {
         if self.resident.remove(key).is_some() {
-            local::invalidate_all(&self.local_caches);
+            local::invalidate_key(&self.local_caches, key);
         }
     }
 
