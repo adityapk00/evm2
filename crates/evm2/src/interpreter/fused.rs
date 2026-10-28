@@ -90,7 +90,7 @@ pub(crate) const fn is_enabled<T: EvmTypesHost, C: EvmConfig<T>>() -> bool {
     let mut opcode = 0;
     loop {
         if config.revision(opcode) != base.revision(opcode)
-            || (UNKNOWN <= opcode && opcode <= LAST && !config.is_unknown_opcode(opcode))
+            || (matches!(opcode, UNKNOWN..=LAST) && !config.is_unknown_opcode(opcode))
         {
             return false;
         }
@@ -123,6 +123,7 @@ pub(crate) const fn opcode_config<T: EvmTypesHost, C: EvmConfig<T>>() -> OpcodeC
     config
 }
 
+/// Returns the combined static gas of the sequence that synthetic opcode `fused` replaces.
 const fn static_gas<T: EvmTypesHost, C: EvmConfig<T>>(fused: u8) -> u16 {
     let sequence = sequence(fused);
     let mut gas = 0;
