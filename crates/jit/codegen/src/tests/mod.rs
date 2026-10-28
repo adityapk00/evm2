@@ -3702,7 +3702,7 @@ tests! {
             modify_message: Some(|message| {
                 let mut input = [0; 96];
                 input[63] = 1;
-                message.input = Bytes::copy_from_slice(&input);
+                message.input = Bytes::copy_from_slice(&input).into();
             }),
             inspect_stack: Some(false),
             expected_return: InstrStop::Stop,
