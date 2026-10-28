@@ -2591,6 +2591,7 @@ dependencies = [
  "aurora-engine-modexp",
  "auto_impl",
  "aws-lc-rs",
+ "bitflags 2.13.2",
  "blst",
  "c-kzg",
  "corosensei",
@@ -2618,6 +2619,7 @@ dependencies = [
  "thiserror 2.0.21",
  "triomphe",
  "typeid",
+ "wincode",
 ]
 
 [[package]]
@@ -2812,6 +2814,7 @@ dependencies = [
  "evm2-jit-codegen",
  "evm2-jit-context",
  "evm2-jit-llvm",
+ "evm2-macros",
  "eyre",
  "libc",
  "libloading",
