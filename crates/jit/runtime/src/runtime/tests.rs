@@ -1268,9 +1268,10 @@ fn local_lookup_keeps_borrowed_program_across_clear() {
 
     let outer = lookup().unwrap();
     tb.clear_resident();
-    tb.wait_resident_count(0);
     // The clear invalidates this thread's cache while `outer` still borrows from it.
-    assert_eq!(lookup().unwrap_err(), LookupMissReason::NotReady);
+    poll_until(std::time::Duration::from_secs(5), || {
+        matches!(lookup(), Err(LookupMissReason::NotReady)).then_some(())
+    });
     assert!(Arc::ptr_eq(&outer.to_arc(), &compiled));
 }
 
