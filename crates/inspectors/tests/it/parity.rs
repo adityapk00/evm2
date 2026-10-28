@@ -1190,6 +1190,26 @@ fn vmtrace_call_cost_includes_forwarded_gas() {
 }
 
 #[test]
+fn vmtrace_call_remaining_gas_without_step_deltas() {
+    // The child spends 4 gas and returns the rest of the forwarded gas to the parent.
+    let code = hex!("5f5f5f5f5f604361fffff100");
+    for config in [
+        TracingInspectorConfig::parity_vm_trace().set_step_deltas(false),
+        TracingInspectorConfig::default_geth(),
+    ] {
+        let trace = inspect_code(&code, &hex!("5f5ffd"), SpecId::PRAGUE, config)
+            .into_parity_builder()
+            .vm_trace();
+        let call = &trace.ops[7];
+        assert_eq!(call.cost, 2_600 + 65_535);
+        assert_eq!(
+            call.ex.as_ref().unwrap().used,
+            trace.ops[6].ex.as_ref().unwrap().used - 2_600 - 4
+        );
+    }
+}
+
+#[test]
 fn vmtrace_precompile_cost_includes_forwarded_gas() {
     let code = hex!("5f5f5f5f5f600461fffff100");
     let trace = inspect_code(&code, &[], SpecId::PRAGUE, TracingInspectorConfig::parity_vm_trace())
