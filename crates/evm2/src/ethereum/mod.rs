@@ -428,9 +428,10 @@ pub const fn validate_floor_gas(gas_limit: u64, floor_gas: u64) -> HandlerResult
 /// Loads and validates the sender account, then warms and touches it.
 ///
 /// Calls and fee-charging transactions consume the nonce before execution. Fee-disabled creates
-/// defer the increment until after the inspector and value-transfer precheck, matching revm's
-/// simulation behavior. Custom handlers that disable fees must validate transfer funding or manage
-/// the nonce themselves if they commit underfunded creations.
+/// defer the increment ([`Evm::defers_create_nonce`]) until after the inspector and
+/// value-transfer precheck, so an underfunded create leaves the nonce unchanged. Custom handlers
+/// that disable fees must validate transfer funding or manage the nonce themselves if they commit
+/// underfunded creations.
 pub fn validate_sender_and_bump_nonce<'a, T: EvmTypes>(
     host: &mut Evm<'a, T>,
     caller: Address,
@@ -442,7 +443,7 @@ pub fn validate_sender_and_bump_nonce<'a, T: EvmTypes>(
     let has_balance_check = host.feature(EvmFeatures::BALANCE_CHECK);
     let has_balance_top_up = host.feature(EvmFeatures::BALANCE_TOP_UP);
     let has_eip3607 = host.feature(EvmFeatures::EIP3607);
-    let has_fee_charge = host.feature(EvmFeatures::FEE_CHARGE);
+    let defers_nonce = to.is_create() && host.defers_create_nonce();
 
     let mut sender = host.state.account(&caller)?;
     if has_eip3607 && !sender.is_empty_code_hash() {
@@ -466,7 +467,7 @@ pub fn validate_sender_and_bump_nonce<'a, T: EvmTypes>(
     // The sender is warm from the start of the transaction (EIP-2929).
     sender.warm();
     sender.touch();
-    if to.is_call() || has_fee_charge {
+    if !defers_nonce {
         sender.bump_nonce();
     }
     Ok(())
@@ -658,9 +659,9 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 if !target_alive {
                     let create_state_gas = host.version().gas_params.create_state_gas();
                     if tx_gas.spend_state(create_state_gas).is_err() {
-                        // A runtime-gas halt still consumes the transaction nonce, including
-                        // fee-disabled creation whose increment was deferred.
-                        if !host.feature(EvmFeatures::FEE_CHARGE) {
+                        // A runtime-gas halt still consumes the transaction nonce, including a
+                        // deferred increment.
+                        if host.defers_create_nonce() {
                             host.state.account(&caller)?.bump_nonce();
                         }
                         return Ok(None);
@@ -1627,6 +1628,37 @@ mod tests {
         );
         let result = evm.transact(&tx).unwrap().commit();
         assert_eq!(result.stop, InstrStop::OutOfGas);
+        assert_eq!(evm.state.account_info_untracked(&caller).unwrap().unwrap().nonce, 11);
+    }
+
+    #[rstest::rstest]
+    fn create_address_collision_consumes_sender_nonce(#[values(false, true)] fee_charge: bool) {
+        let caller = Address::with_last_byte(0xaa);
+        let spec = SpecId::PRAGUE;
+        let mut version = Version::new(spec);
+        version.features.set(EvmFeatures::FEE_CHARGE, fee_charge);
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(&caller, AccountInfo::default().with_nonce(10));
+        database.insert_account_info(&caller.create(10), AccountInfo::default().with_nonce(1));
+        let mut evm = Evm::<BaseEvmTypes>::new_with_execution_config(
+            ExecutionConfig::for_spec_and_version(spec, version),
+            spec,
+            BlockEnvExt { gas_limit: U256::from(10_000_000), ..Default::default() },
+            ethereum_tx_registry(spec),
+            database,
+            Precompiles::base(spec),
+        );
+        let tx = Recovered::new_unchecked(
+            TxEnvelope::Legacy(TxLegacy {
+                nonce: 10,
+                gas_limit: 500_000,
+                to: TxKind::Create,
+                ..Default::default()
+            }),
+            caller,
+        );
+        let result = evm.transact(&tx).unwrap().commit();
+        assert_eq!(result.stop, InstrStop::CreateCollision);
         assert_eq!(evm.state.account_info_untracked(&caller).unwrap().unwrap().nonce, 11);
     }
 

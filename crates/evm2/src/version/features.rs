@@ -166,9 +166,10 @@ evm_features! {
     BALANCE_TOP_UP,
     /// Charges transaction fees.
     ///
-    /// When disabled, top-level creation follows revm's simulation behavior: an insufficient
-    /// value balance leaves the sender nonce unchanged. Custom handlers committing these
-    /// transactions must validate transfer funding or manage their nonce accounting themselves.
+    /// When disabled, top-level creation consumes the sender nonce only after the value-transfer
+    /// funds check, so an insufficient balance leaves the nonce unchanged. Custom handlers
+    /// committing these transactions must validate transfer funding or manage their nonce
+    /// accounting themselves.
     ///
     /// Default: on
     FEE_CHARGE,

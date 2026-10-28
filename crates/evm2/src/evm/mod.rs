@@ -1006,6 +1006,18 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.features.contains(feature)
     }
 
+    /// Returns `true` if a top-level create leaves the sender nonce to the create path.
+    ///
+    /// Fee-charging transactions consume it during sender validation. Without fee charging, the
+    /// increment waits until the inspector's create hook and the value-transfer funds check have
+    /// passed, so an underfunded create leaves the nonce unchanged. Every exit that follows
+    /// validation and consumes the nonce must follow this decision: the create path and the
+    /// runtime state-gas halt in [`prepare_initial_frame`](crate::ethereum::prepare_initial_frame).
+    #[inline]
+    pub const fn defers_create_nonce(&self) -> bool {
+        !self.feature(EvmFeatures::FEE_CHARGE)
+    }
+
     /// Returns the active base specification ID.
     #[inline]
     pub fn spec_id(&self) -> SpecId {
@@ -1422,9 +1434,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         // constructed); warm it before running the initcode.
         self.state.account(&message.destination)?.warm();
 
-        // Fee-disabled top-level creation defers its nonce increment until the inspector's
-        // value has passed the funds check, just like nested creation.
-        if (nested || !self.feature(EvmFeatures::FEE_CHARGE))
+        // A deferred top-level creation consumes its nonce here, just like nested creation.
+        if (nested || self.defers_create_nonce())
             && let Err(code) = self.state.account(&message.caller).map(|mut a| a.bump_nonce())
         {
             return Err(code.into());
