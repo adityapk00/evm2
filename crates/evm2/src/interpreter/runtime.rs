@@ -1,6 +1,6 @@
 use super::{
-    BytecodeRef, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result, StackBacking,
-    StackMut, StackRef, Word,
+    BytecodeRef, Gas, Host, InstrStop, Memory, Message, Pc, Result, StackBacking, StackMut,
+    StackRef, Word,
 };
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
@@ -19,9 +19,12 @@ use derive_where::derive_where;
 /// EVM interpreter.
 #[derive_where(Debug)]
 pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
-    pub(in crate::interpreter) bytecode: Bytecode,
-    // Borrows the immutable allocations owned by `bytecode`. Cleared before replacing it;
-    // accessors must shorten the erased lifetime to the borrow of this interpreter.
+    // Borrowed from the frame's message rather than cloned: a per-frame `Arc` clone writes the
+    // shared refcount next to the read-mostly bytecode, which bounces between last-level caches
+    // when threads on several of them run the same contracts.
+    pub(in crate::interpreter) bytecode: &'frame Bytecode,
+    // Borrows the immutable allocations of `bytecode`. Cleared before replacing it; accessors
+    // must shorten the erased lifetime to the borrow of this interpreter.
     bytecode_ref: Option<BytecodeRef<'static>>,
     pub(in crate::interpreter) memory: Memory,
     pub(in crate::interpreter) return_data: Bytes,
@@ -47,8 +50,8 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
 }
 
 // SAFETY: The interpreter's internal pointers are always valid. `pc` and `bytecode_ref` point into
-// immutable owned bytecode and its jump table. Frame-local references are cleared before pooling,
-// and host/inspector pointers are installed for
+// the frame's immutable bytecode and its jump table. Frame-local references are cleared before
+// pooling, and host/inspector pointers are installed for
 // execution and not used after the owning execution context is gone. The `Sync` bounds make the
 // retained shared frame references safe to transfer between threads.
 unsafe impl<T> Send for Interpreter<'_, '_, T>
@@ -73,7 +76,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     ///
     /// Must call `init` before use.
     unsafe fn uninit() -> Self {
-        let bytecode = Bytecode::new();
+        let bytecode = <&Bytecode>::default();
         Self {
             pc: bytecode.original_byte_slice().as_ptr(),
             bytecode,
@@ -99,12 +102,9 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
     /// Initializes this interpreter for a new frame, retaining reusable allocations.
     fn init(&mut self, tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) {
-        let bytecode = message.code.clone();
         let gas_limit = message.gas_limit;
-        let is_static = message.caller_is_static || matches!(message.kind, MessageKind::StaticCall);
-        self.pc = bytecode.bytes_slice().as_ptr();
-        self.bytecode_ref = None;
-        self.bytecode = bytecode;
+        let is_static = message.is_static();
+        self.set_bytecode(&message.code);
         self.stack_len = 0;
         self.gas = Gas::new_with_execution_gas_and_reservoir(gas_limit, message.reservoir);
         self.memory.clear();
@@ -117,7 +117,16 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.return_data = Bytes::new();
     }
 
-    pub(crate) const fn clear_frame_refs(&mut self) {
+    /// Points the interpreter at `bytecode` and resets the program counter and the cached view.
+    pub(crate) fn set_bytecode(&mut self, bytecode: &'frame Bytecode) {
+        self.pc = bytecode.bytes_slice().as_ptr();
+        self.bytecode_ref = None;
+        self.bytecode = bytecode;
+    }
+
+    pub(crate) fn clear_frame_refs(&mut self) {
+        self.bytecode = Default::default();
+        self.bytecode_ref = None;
         self.tx_env = None;
         self.message = None;
         self.host = None;
@@ -177,7 +186,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Returns the active bytecode.
     #[inline]
     pub fn bytecode(&self) -> BytecodeRef<'_> {
-        self.bytecode_ref.unwrap_or_else(|| BytecodeRef::new(&self.bytecode))
+        self.bytecode_ref.unwrap_or_else(|| BytecodeRef::new(self.bytecode))
     }
 
     /// Returns the original active bytecode bytes.
@@ -299,6 +308,16 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         (self.stack(), self.memory.as_slice(), host)
     }
 
+    /// Borrows linear memory and the host independently, so memory can be passed to the host
+    /// without copying.
+    #[inline]
+    pub const fn memory_host(&mut self) -> (&Memory, &mut T::Host<'host>) {
+        // SAFETY: As in `host`, the host pointer is initialized during execution and points
+        // outside the interpreter's owned memory.
+        let host = unsafe { self.host.unwrap_unchecked().as_mut() };
+        (&self.memory, host)
+    }
+
     /// Returns the host implementation.
     #[inline]
     pub const fn host(&mut self) -> &mut T::Host<'host> {
@@ -401,10 +420,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[doc(hidden)]
     pub fn prepare_run(&mut self, host: &mut T::Host<'host>) {
         if self.bytecode_ref.is_none() {
-            // SAFETY: The view borrows immutable allocations retained by our owned `Bytecode`,
-            // so moving the interpreter does not invalidate it. `init` clears the view before
-            // replacing the owner, and accessors tie the returned view to `&self`.
-            let bytecode = unsafe { trustme::decouple_lt(&self.bytecode) };
+            // SAFETY: The view borrows immutable allocations of the frame's `Bytecode`, which
+            // outlives the interpreter's `'frame` borrow, so moving the interpreter does not
+            // invalidate it. `init` and `clear_frame_refs` clear the view before replacing the
+            // borrow, and accessors tie the returned view to `&self`.
+            let bytecode = unsafe { trustme::decouple_lt(self.bytecode) };
             self.bytecode_ref = Some(BytecodeRef::new(bytecode));
         }
         let config = host.execution_config();
@@ -414,6 +434,53 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.features = version.features;
         self.host = Some(NonNull::from(host));
         self.inspector = None;
+    }
+
+    /// Runs the host's instruction implementation for the opcode at `pc` on the interpreter
+    /// stack, which holds `stack_len` words, and returns the new stack length.
+    ///
+    /// Gas is read from and written to this interpreter, so the caller must keep it current.
+    ///
+    /// # Safety
+    ///
+    /// The first `stack_len` words of the stack must be initialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`prepare_run`](Self::prepare_run) has not run, or if `pc` or `stack_len` is out
+    /// of bounds.
+    #[doc(hidden)]
+    pub unsafe fn run_external_instruction(
+        &mut self,
+        pc: usize,
+        stack_len: usize,
+    ) -> core::result::Result<usize, InstrStop> {
+        let bytecode = self.bytecode_ref.expect("`prepare_run` must precede external instructions");
+        assert!(pc < self.bytecode.original_byte_slice().len(), "pc out of bounds");
+        assert!(stack_len <= StackMut::CAPACITY, "stack length out of bounds");
+        let host = self.host.expect("`prepare_run` must precede external instructions");
+        // SAFETY: `prepare_run` installed the host, which outlives the run.
+        let config = unsafe { host.as_ref() }.execution_config();
+        // SAFETY: `pc` is in bounds.
+        let mut pc = Pc::new(unsafe { bytecode.as_ptr().add(pc) });
+        let instr = config.opcode_config().instruction(pc.op()).instr;
+        self.stack_len = stack_len;
+        let this: *mut Self = self;
+        // SAFETY: Instructions must not access the stack through `InterpreterState` while the
+        // separate stack view is live, as in the dispatch loop.
+        let (state, mut stack) = unsafe {
+            (
+                InterpreterState::wrap_mut(&mut *this),
+                StackMut { stack: &mut (*this).stack, len: &mut (*this).stack_len },
+            )
+        };
+        let start = pc.as_ptr();
+        instr(&mut pc, stack.reborrow(), state)?;
+        // Compiled code continues at the next instruction.
+        if pc.as_ptr() != start {
+            return Err(InstrStop::FatalExternalError);
+        }
+        Ok(self.stack_len)
     }
 
     #[inline(never)]

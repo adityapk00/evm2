@@ -1,6 +1,9 @@
 //! Owned pending transaction state detached from the EVM.
 
-use super::{Account, AccountInfo, StateChangeSink, StateChangeSource, StorageSlot, Tracked};
+use super::{
+    Account, AccountChanges, AccountFlags, AccountInfo, StateChangeSink, StateChangeSource,
+    StorageSlot, Tracked,
+};
 use crate::interpreter::Word;
 use alloy_primitives::{
     Address,
@@ -55,13 +58,13 @@ impl PendingState {
     ) {
         let code_changed = original.as_ref().map(|account| account.code_hash)
             != current.as_ref().map(|account| account.code_hash);
+        let flags = if code_changed { AccountFlags::CODE_CHANGED } else { AccountFlags::empty() };
         let account = self.accounts.entry(address).or_default();
         *account = Account {
             original,
             present: current,
-            code_changed,
+            flags,
             storage: core::mem::take(&mut account.storage),
-            ..Account::default()
         };
     }
 
@@ -91,11 +94,24 @@ impl PendingState {
     /// Loaded-but-unchanged accounts and storage slots are ignored.
     #[cfg(test)]
     pub(crate) fn is_changed(&self) -> bool {
-        self.accounts.values().any(|account| {
-            account.is_changed()
-                || account.storage.wiped
-                || account.storage.changed_slots().next().is_some()
+        self.accounts.values().any(|account| account.is_changed() || account.storage.is_changed())
+    }
+
+    /// Returns each loaded account's changes, in an unspecified account order.
+    #[inline]
+    pub fn account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
+        self.accounts.iter().map(|(&address, account)| {
+            account.changes(address, self.selfdestructs.contains(&address))
         })
+    }
+
+    /// Returns the changes of the account at `address`, or `None` if the transaction did not load
+    /// it.
+    #[inline]
+    pub fn account_changes_for(&self, address: &Address) -> Option<AccountChanges<'_>> {
+        self.accounts
+            .get(address)
+            .map(|account| account.changes(*address, self.selfdestructs.contains(address)))
     }
 }
 
@@ -110,8 +126,8 @@ impl StateChangeSource for PendingState {
     /// unchanged — go through [`StateChangeSink::account`]; loaded-but-unchanged entries go
     /// through the read callbacks.
     fn visit<S: StateChangeSink>(&self, sink: &mut S) -> Result<(), S::Error> {
-        for (&address, entry) in &self.accounts {
-            entry.visit(address, self.selfdestructs.contains(&address), sink)?;
+        for changes in self.account_changes() {
+            changes.visit(sink)?;
         }
         Ok(())
     }
@@ -139,5 +155,33 @@ mod tests {
             state.accounts[&address].storage.slots[&key].value,
             Tracked::from_parts(Word::from(2), Word::from(3))
         );
+    }
+
+    #[test]
+    fn account_changes_for_looks_up_one_address() {
+        let changed = Address::with_last_byte(0xaa);
+        let unchanged = Address::with_last_byte(0xbb);
+        let info = AccountInfo { nonce: 1, ..AccountInfo::default() };
+        let mut state = PendingState::default();
+        state.insert_account(
+            changed,
+            Some(info.clone()),
+            Some(AccountInfo { nonce: 2, ..info.clone() }),
+        );
+        state.insert_account(unchanged, Some(info.clone()), Some(info.clone()));
+        let destroyed = Address::with_last_byte(0xdd);
+        state.insert_account(destroyed, Some(info.clone()), Some(info));
+        state.selfdestructs.insert(destroyed);
+
+        let changes = state.account_changes_for(&changed).unwrap();
+        assert_eq!(changes.address, changed);
+        assert!(changes.is_changed());
+        let changes = state.account_changes_for(&unchanged).unwrap();
+        assert_eq!(changes.address, unchanged);
+        assert!(!changes.is_changed());
+        let changes = state.account_changes_for(&destroyed).unwrap();
+        assert!(changes.selfdestructed);
+        assert!(changes.is_changed());
+        assert!(state.account_changes_for(&Address::with_last_byte(0xcc)).is_none());
     }
 }
