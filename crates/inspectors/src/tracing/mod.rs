@@ -652,10 +652,9 @@ impl TracingInspector {
         }
 
         // The gas cost is the difference between the recorded gas remaining at the start of the
-        // step the remaining gas here, at the end of the step.
-        step.gas_cost = interp
-            .failed_charge()
-            .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        // step and the remaining gas here, at the end of the step. A plain out-of-gas step
+        // consumes the whole remainder; other out-of-gas halts keep their balance.
+        step.gas_cost = step.gas_remaining.saturating_sub(interp.gas().remaining());
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
