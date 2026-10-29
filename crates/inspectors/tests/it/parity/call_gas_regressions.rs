@@ -23,6 +23,33 @@ fn geth_create_cost_uses_its_own_child_after_filtered_call() {
 }
 
 #[test]
+fn geth_create_without_child_ignores_filtered_call_child() {
+    // The CREATE fails for lack of balance before it starts a child, so the child that follows
+    // belongs to the CALL.
+    let code = hex!("5f5f6001f0505f5f5f5f5f604361fffff100");
+    let geth_logs = |config| {
+        inspect_code(&code, &hex!("00"), SpecId::AMSTERDAM, config)
+            .geth_builder()
+            .geth_traces(0, Default::default(), Default::default())
+            .struct_logs
+    };
+    let expected = geth_logs(TracingInspectorConfig::default_geth())
+        .into_iter()
+        .find(|log| log.opcode() == "CREATE")
+        .unwrap()
+        .gas_cost;
+    assert_ne!(expected, 0);
+
+    let logs = geth_logs(TracingInspectorConfig {
+        record_opcodes_filter: Some(OpcodeFilter::new().enabled(OpCode::CREATE)),
+        ..TracingInspectorConfig::default_geth()
+    });
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].opcode(), "CREATE");
+    assert_eq!(logs[0].gas_cost, expected);
+}
+
+#[test]
 fn vmtrace_post_call_gas_does_not_require_memory_or_storage_deltas() {
     for code in [
         &hex!("5f5f5f5f5f604361fffff100")[..],

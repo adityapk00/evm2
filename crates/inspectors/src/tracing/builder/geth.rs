@@ -117,11 +117,17 @@ impl<'a> GethTraceBuilder<'a> {
             let mut log =
                 step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1, stack);
 
-            if matches!(step.op.get(), op::CREATE | op::CREATE2)
-                && let Some(child_id) = call_child_id
+            if let Some(child_id) = call_child_id
+                && let child = &self.nodes[child_id].trace
+                && matches!(
+                    (step.op.get(), child.kind),
+                    (op::CREATE, CallKind::Create) | (op::CREATE2, CallKind::Create2)
+                )
             {
                 // Geth logs CREATE before its opcode implementation forwards gas to the child.
-                log.gas_cost = log.gas_cost.saturating_sub(self.nodes[child_id].trace.gas_limit);
+                // A CREATE that failed before starting a child can be followed by the child of a
+                // filtered call, which does not receive forwarded gas from this step.
+                log.gas_cost = log.gas_cost.saturating_sub(child.gas_limit);
             }
 
             // Only touch the storage cache when updating it or emitting a storage snapshot.
