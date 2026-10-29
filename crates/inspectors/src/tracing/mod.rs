@@ -654,10 +654,13 @@ impl TracingInspector {
 
         // Call costs are captured before child execution returns unused gas. A zero cost
         // also covers calls that failed before reaching their hook.
-        if step.gas_cost == 0 {
-            step.gas_cost = interp
-                .failed_charge()
-                .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        //
+        // Otherwise the gas cost is the difference between the recorded gas remaining at the start
+        // of the step and the remaining gas here, at the end of the step. An out-of-gas step
+        // consumes the whole remainder, except the reentrancy sentry, which halts before any
+        // charge.
+        if step.gas_cost == 0 && interp.result() != Err(InstrStop::ReentrancySentryOOG) {
+            step.gas_cost = step.gas_remaining.saturating_sub(interp.gas().remaining());
         }
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {

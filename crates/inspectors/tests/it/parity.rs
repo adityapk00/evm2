@@ -1254,3 +1254,6 @@ fn vmtrace_nested_calls_preserve_each_forwarded_cost() {
 
 #[path = "parity/call_gas_regressions.rs"]
 mod call_gas_regressions;
+
+#[path = "parity/oog_cost.rs"]
+mod oog_cost;

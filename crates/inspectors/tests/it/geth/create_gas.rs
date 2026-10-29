@@ -147,7 +147,7 @@ fn structured_create_cost_includes_memory_and_initcode_charges() {
 }
 
 #[test]
-fn structured_create_without_child_keeps_attempted_cost() {
+fn structured_create_without_child_costs_remaining_gas() {
     for code in [&hex!("5f5f5ff000")[..], &hex!("5f5f5f5ff500")[..]] {
         let (inspector, gas_used, success) =
             inspect(code, &[], 53_000, TracingInspectorConfig::default_geth());
@@ -160,7 +160,9 @@ fn structured_create_without_child_keeps_attempted_cost() {
             GethDefaultTracingOptions::default(),
         );
         assert!(frame.failed);
-        assert_eq!(frame.struct_logs.last().unwrap().gas_cost, 32_000);
+        // The out-of-gas CREATE consumes the gas left after its PUSH0s, 2 gas each.
+        let pushes = code.len() as u64 - 2;
+        assert_eq!(frame.struct_logs.last().unwrap().gas_cost, 32_000 - 2 * pushes);
     }
 }
 
