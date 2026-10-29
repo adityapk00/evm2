@@ -333,10 +333,8 @@ impl MemWords {
         let imm = |depth: usize| inputs[inputs.len() - 1 - depth].as_const()?.get_inline();
         let bounds = |depth: usize| inputs[inputs.len() - 1 - depth].bounds();
         let len = |depth: usize| bounds(depth).map(|len| len.last);
-        let pristine = std::mem::take(&mut self.pristine);
         match opcode {
             op::MLOAD => {
-                self.pristine = pristine;
                 let offset = imm(0)?;
                 let i = self.words.binary_search_by_key(&offset, |&(o, _)| o).ok()?;
                 return Some(self.words[i].1);
@@ -347,35 +345,31 @@ impl MemWords {
                 if let Some(offset) = imm(0)
                     && value != AbsValue::Top
                 {
-                    let i = self.words.partition_point(|&(o, _)| o < offset);
-                    self.words.insert(i, (offset, value));
+                    self.set(offset, value);
                 }
             }
             op::MSTORE8 => self.clobber(bounds(0), Some(1)),
             op::CODECOPY => {
-                let word = self.codecopy_word(pristine, imm(0), imm(1), imm(2), code, interner);
+                let word = self.codecopy_word(imm(0), imm(1), imm(2), code, interner);
                 self.clobber(bounds(0), len(2));
                 if let Some((offset, value)) = word {
-                    let i = self.words.partition_point(|&(o, _)| o < offset);
-                    self.words.insert(i, (offset, AbsValue::Const(U256Imm::new(value, interner))));
+                    self.set(offset, AbsValue::Const(U256Imm::new(value, interner)));
                 }
             }
             op::CALLDATACOPY | op::RETURNDATACOPY | op::MCOPY => self.clobber(bounds(0), len(2)),
             op::EXTCODECOPY => self.clobber(bounds(1), len(3)),
             op::CALL | op::CALLCODE => self.clobber(bounds(5), len(6)),
             op::DELEGATECALL | op::STATICCALL => self.clobber(bounds(4), len(5)),
-            // Instructions that do not write memory keep it empty.
-            _ => self.pristine = pristine,
+            _ => {}
         }
         None
     }
 
     /// Returns the word that a `CODECOPY` of `len` bytes at `src` to `dest` leaves at the end of
     /// its destination, where memory expansion covers it, if the rest of that word is known: a
-    /// tracked word at the same offset, or zeros when memory is `pristine` with no tracked word.
+    /// tracked word at the same offset, or zeros when memory is `pristine`.
     fn codecopy_word(
         &self,
-        pristine: bool,
         dest: Option<u32>,
         src: Option<u32>,
         len: Option<u32>,
@@ -387,22 +381,30 @@ impl MemWords {
         let len = len as usize;
         let base = match self.words.binary_search_by_key(&offset, |&(o, _)| o) {
             Ok(i) => self.words[i].1.as_const()?.get(interner),
-            Err(_) if pristine && self.words.is_empty() => U256::ZERO,
+            Err(_) if self.pristine => U256::ZERO,
             Err(_) => return None,
         };
+        let mut word = base.to_be_bytes::<32>();
+        let copied = &mut word[32 - len..];
+        copied.fill(0);
         // Bytes past the end of the code are zero.
-        let mut copied = [0; 32];
-        if let Some(bytes) = code.get(src..) {
-            let bytes = &bytes[..len.min(bytes.len())];
-            copied[32 - len..][..bytes.len()].copy_from_slice(bytes);
+        if let Some(code) = code.get(src..) {
+            let n = len.min(code.len());
+            copied[..n].copy_from_slice(&code[..n]);
         }
-        let mask = U256::MAX >> (256 - 8 * len);
-        Some((offset, base & !mask | U256::from_be_bytes(copied)))
+        Some((offset, U256::from_be_bytes(word)))
+    }
+
+    /// Records the known `value` of the word at `offset`.
+    fn set(&mut self, offset: u32, value: AbsValue) {
+        let i = self.words.partition_point(|&(o, _)| o < offset);
+        self.words.insert(i, (offset, value));
     }
 
     /// Forgets every word that a write of at most `len` bytes at an offset in `offset` may
-    /// overlap.
+    /// overlap, and clears `pristine`.
     fn clobber(&mut self, offset: Option<RangeInclusive<u32>>, len: Option<u32>) {
+        self.pristine = false;
         match (offset, len) {
             (_, Some(0)) => {}
             (Some(offset), len) => {
@@ -4449,18 +4451,38 @@ mod tests_edge_cases {
         ];
         for op in ["CALLDATACOPY", "CODECOPY", "RETURNDATACOPY", "MCOPY", "PUSH0 EXTCODECOPY"] {
             for (operands, expected) in cases {
-                // A constant `CODECOPY` ending the word replaces its last byte with the first byte
-                // of the code, the opcode of the first `PUSH`.
-                let expected = if op == "CODECOPY" && operands == "PUSH 1 PUSH0 PUSH 0x5f" {
-                    Some(U256::from(op::PUSH1))
-                } else {
-                    expected
-                };
+                // A constant `CODECOPY` ending the word rewrites it, see
+                // `mload_word_after_codecopy`.
+                if op == "CODECOPY" && operands == "PUSH 1 PUSH0 PUSH 0x5f" {
+                    continue;
+                }
                 assert_eq!(
                     mload_0x40_after(&format!("{operands} {op}")),
                     expected,
                     "{operands} {op}"
                 );
+            }
+        }
+    }
+
+    /// A constant `CODECOPY` that ends the word at `0x40` replaces its last bytes with the copied
+    /// code, and zeros past the end of the code.
+    #[test]
+    fn mload_word_after_codecopy() {
+        for len in [1u8, 2, 16, 31, 32] {
+            for src in [0usize, 3, 20, 1000] {
+                let copy = format!("PUSH {len} PUSH {src} PUSH {:#x} CODECOPY", 0x60 - len);
+                let code = crate::parse_asm(&format!(
+                    "PUSH 0x80 PUSH 0x40 MSTORE\n{copy}\nPUSH 0x40 MLOAD PUSH0 MSTORE STOP"
+                ))
+                .unwrap();
+                let mut memory = [0u8; 0x60];
+                memory[0x5f] = 0x80;
+                for (i, byte) in memory[0x60 - len as usize..].iter_mut().enumerate() {
+                    *byte = code.get(src + i).copied().unwrap_or(0);
+                }
+                let expected = U256::from_be_slice(&memory[0x40..]);
+                assert_eq!(mload_0x40_after(&copy), Some(expected), "{copy}");
             }
         }
     }
