@@ -5,7 +5,7 @@ use crate::tracing::{
     types::{CallKind, CallTraceNode, CallTraceStepStackItem},
     utils::load_account_code,
 };
-use alloc::{borrow::Cow, collections::BTreeMap, format, vec, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, format, vec, vec::Vec};
 use alloy_primitives::{
     Address, B256, Bytes, U256,
     map::{Entry, HashMap},
@@ -24,13 +24,16 @@ use evm2::{
 /// A frame awaiting tree assembly, with visibility inherited by children in the forward pass.
 struct PendingCallFrame<T> {
     /// Whether this call and its ancestors permit descendant logs. Independent of whether
-    /// the frame itself contains logs; root-frame logs retain their existing special handling.
+    /// the frame itself contains logs.
     logs_visible: bool,
     frame: T,
 }
 
 #[cfg(test)]
 mod steps_tests;
+
+/// The stack snapshots taken from one node's steps, in step order.
+pub(crate) type StackSnapshots = vec::IntoIter<Option<Box<[U256]>>>;
 
 /// A type for creating geth style traces
 #[derive(Clone, Debug)]
@@ -83,6 +86,7 @@ impl<'a> GethTraceBuilder<'a> {
         opts: &GethDefaultTracingOptions,
         storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
         struct_logs: &mut Vec<StructLog>,
+        mut stacks: Option<&mut [StackSnapshots]>,
     ) {
         // Suspend only the parent iterator when entering a child. Scratch space scales with
         // call depth rather than step count, and a trace without subcalls needs no allocation.
@@ -103,7 +107,15 @@ impl<'a> GethTraceBuilder<'a> {
             // We increment the depth by one because steps that are part of call at depth N should
             // have depth N + 1. For example, steps inside of a top-level call should
             // have depth 1.
-            let mut log = step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1);
+            let stack = if !opts.is_stack_enabled() {
+                None
+            } else if let Some(stacks) = stacks.as_deref_mut() {
+                stacks[trace_node.idx].next().flatten().map(Vec::from)
+            } else {
+                step.stack.as_deref().map(<[U256]>::to_vec)
+            };
+            let mut log =
+                step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1, stack);
 
             // Only touch the storage cache when updating it or emitting a storage snapshot.
             if opts.is_storage_enabled()
@@ -144,7 +156,7 @@ impl<'a> GethTraceBuilder<'a> {
         return_value: Bytes,
         opts: GethDefaultTracingOptions,
     ) -> DefaultFrame {
-        self.geth_traces_inner(receipt_gas_used, None, return_value, opts)
+        self.geth_traces_inner(receipt_gas_used, None, return_value, opts, None)
     }
 
     /// Generate a geth-style trace with EIP-8037 transaction gas accounting.
@@ -159,15 +171,21 @@ impl<'a> GethTraceBuilder<'a> {
             Some((gas.execution_gas_spent(), gas.state_gas_spent(), final_refunded(gas))),
             return_value,
             opts,
+            None,
         )
     }
 
-    fn geth_traces_inner(
+    /// Generate a geth-style trace.
+    ///
+    /// If `stacks` is set, the struct log stacks are taken from it instead of copied from the
+    /// steps. It holds the stack snapshots of each node's steps in step order, indexed by node.
+    pub(crate) fn geth_traces_inner(
         &self,
         receipt_gas_used: u64,
         gas: Option<(u64, u64, u64)>,
         return_value: Bytes,
         opts: GethDefaultTracingOptions,
+        stacks: Option<&mut [StackSnapshots]>,
     ) -> DefaultFrame {
         if self.nodes.is_empty() {
             return Default::default();
@@ -184,7 +202,7 @@ impl<'a> GethTraceBuilder<'a> {
         );
         let mut struct_logs = Vec::with_capacity(capacity);
         let mut storage = HashMap::default();
-        self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs);
+        self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs, stacks);
 
         let gas = gas.filter(|_| self.is_eip8037_enabled());
 
@@ -235,12 +253,22 @@ impl<'a> GethTraceBuilder<'a> {
         let include_logs = opts.with_log.unwrap_or_default();
         // first fill up the root
         let main_trace_node = &self.nodes[0];
-        let mut root_call_frame = main_trace_node.geth_empty_call_frame(include_logs);
+        // Like any other failed call, a failed root drops its own logs.
+        let root_logs_visible = include_logs && !main_trace_node.trace.is_error();
+        let mut root_call_frame = main_trace_node.geth_empty_call_frame(root_logs_visible);
         root_call_frame.gas_used = U256::from(gas_used);
         if let Some(gas) = gas.filter(|_| self.is_eip8037_enabled()) {
             root_call_frame.execution_gas_used = Some(U256::from(gas.0));
             root_call_frame.state_gas_used = Some(U256::from(gas.1));
             root_call_frame.gas_refund = Some(U256::from(gas.2));
+        }
+
+        if opts.only_top_call.unwrap_or_default() {
+            // No subcall frames are collected, so logs have no position relative to them.
+            for log in &mut root_call_frame.logs {
+                log.position = Some(0);
+            }
+            return root_call_frame;
         }
 
         // selfdestructs are not recorded as individual call traces but are derived from
@@ -249,18 +277,12 @@ impl<'a> GethTraceBuilder<'a> {
             root_call_frame.calls.push(selfdestruct);
         }
 
-        if opts.only_top_call.unwrap_or_default() {
-            return root_call_frame;
-        }
-
         // fill all the call frames in the root call frame with the recorded traces.
         // traces are identified by their index in the arena
         // so we can populate the call frame tree by walking up the call tree
         let mut call_frames = Vec::with_capacity(self.nodes.len());
-        call_frames.push(PendingCallFrame {
-            logs_visible: include_logs && !main_trace_node.trace.is_error(),
-            frame: root_call_frame,
-        });
+        call_frames
+            .push(PendingCallFrame { logs_visible: root_logs_visible, frame: root_call_frame });
 
         for trace in self.nodes.iter().skip(1) {
             // Parents precede their children, so inherit log visibility without walking back
@@ -339,6 +361,11 @@ impl<'a> GethTraceBuilder<'a> {
         for (addr, loaded_acc) in state.accounts.iter() {
             let addr = *addr;
             let db_acc = db.get_account(&addr)?.unwrap_or_default();
+            // Geth omits accounts that were empty before execution, even if fees fund them.
+            // Check the original code hash before applying the disableCode output option.
+            if db_acc.is_empty() {
+                continue;
+            }
             let code = if code_enabled { load_account_code(db, &db_acc)? } else { None };
             let mut acc_state = AccountState::from_account_info(db_acc.nonce, db_acc.balance, code);
 
@@ -475,7 +502,8 @@ impl<'a> GethTraceBuilder<'a> {
         let include_logs = opts.with_log.unwrap_or_default();
         // only the root frame's own fields are needed, its children are assembled below
         let mut top_call = {
-            let mut root = self.nodes[0].geth_empty_call_frame(include_logs);
+            let root_logs_visible = include_logs && !self.nodes[0].trace.is_error();
+            let mut root = self.nodes[0].geth_empty_call_frame(root_logs_visible);
             root.gas_used = U256::from(gas_used);
             Some(root)
         };
@@ -761,7 +789,7 @@ mod tests {
                     visited.push(idx);
                     assert_eq!(call.to, erc.to);
                     assert_eq!(call.logs, erc.logs);
-                    let visible = with_log && (idx == 0 || (idx >= 5 && !root_failed));
+                    let visible = with_log && !root_failed && (idx == 0 || idx >= 5);
                     assert_eq!(call.logs.len(), if visible { 2 } else { 0 }, "node {idx}");
                     if visible {
                         for (log_idx, log) in call.logs.iter().enumerate() {
@@ -876,5 +904,59 @@ mod tests {
             builder.geth_prestate_pre_traces(&state, &mut db, false, false),
             Err(err) if err == error
         ));
+    }
+
+    #[test]
+    fn prestate_omits_initially_empty_accounts() {
+        let absent_beneficiary = Address::with_last_byte(1);
+        let empty_beneficiary = Address::with_last_byte(2);
+        let funded_beneficiary = Address::with_last_byte(3);
+        let nonce_account = Address::with_last_byte(4);
+        let contract = Address::with_last_byte(5);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(&empty_beneficiary, AccountInfo::default());
+        db.insert_account_info(
+            &funded_beneficiary,
+            AccountInfo::default().with_balance(U256::from(10)),
+        );
+        db.insert_account_info(&nonce_account, AccountInfo::default().with_nonce(1));
+        db.insert_account_info(&contract, AccountInfo::default().with_code(code.clone()));
+
+        let mut state = TxState::default();
+        for address in [absent_beneficiary, empty_beneficiary] {
+            state.accounts.insert(
+                address,
+                TxAccount {
+                    current: Some(AccountInfo::default().with_balance(U256::from(1))),
+                    ..Default::default()
+                },
+            );
+        }
+        // An account emptied by execution must retain its original prestate.
+        for address in [funded_beneficiary, nonce_account, contract] {
+            state.accounts.insert(address, TxAccount::default());
+        }
+
+        let builder = GethTraceBuilder::new(Vec::new());
+        for code_enabled in [false, true] {
+            let frame =
+                builder.geth_prestate_pre_traces(&state, &mut db, code_enabled, false).unwrap();
+            assert_eq!(
+                frame,
+                PreStateFrame::Default(PreStateMode(BTreeMap::from([
+                    (funded_beneficiary, AccountState::from_account_info(0, U256::from(10), None)),
+                    (nonce_account, AccountState::from_account_info(1, U256::ZERO, None)),
+                    (
+                        contract,
+                        AccountState::from_account_info(
+                            0,
+                            U256::ZERO,
+                            code_enabled.then(|| code.original_bytes()),
+                        )
+                    ),
+                ]))),
+            );
+        }
     }
 }

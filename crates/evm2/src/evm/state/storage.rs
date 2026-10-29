@@ -23,6 +23,24 @@ pub struct StorageOverlay {
 }
 
 impl StorageOverlay {
+    /// Applies an isolated execution's slots, retaining parent originals and combining warmth.
+    #[cfg(test)]
+    pub(crate) fn merge_isolated(&mut self, child: Self) {
+        self.wiped |= child.wiped;
+        for (key, slot) in child.slots {
+            match self.slots.entry(key) {
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(slot);
+                }
+                hash_map::Entry::Occupied(mut entry) => {
+                    let parent = entry.get_mut();
+                    parent.value.current = slot.value.current;
+                    parent.is_warm |= slot.is_warm;
+                }
+            }
+        }
+    }
+
     /// Returns the changed storage slots.
     ///
     /// A slot is changed when its current value differs from its transaction-boundary original,
@@ -32,6 +50,13 @@ impl StorageOverlay {
         self.slots
             .iter()
             .filter_map(|(key, slot)| slot.is_changed(self.wiped).then_some((key, &slot.value)))
+    }
+
+    /// Returns whether the overlay changes the account's storage: it is wiped or has a changed
+    /// slot.
+    #[inline]
+    pub fn is_changed(&self) -> bool {
+        self.wiped || self.changed_slots().next().is_some()
     }
 }
 
@@ -79,9 +104,11 @@ impl StorageSlot {
 #[derive_where(Debug)]
 pub struct StorageHandle<'a, 'db> {
     /// Address of the account whose storage this handle exposes.
-    address: Address,
+    address: &'a Address,
     /// Transaction overlay entry: the per-account storage slots plus the wipe flag.
     storage: &'a mut StorageOverlay,
+    /// Whether the account was created in this transaction, so its unloaded slots read as zero.
+    created: bool,
     /// Shared inner state: backing database, revert journal, and base warm set.
     #[derive_where(skip)]
     inner: &'a mut StateInner<'db>,
@@ -92,17 +119,18 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
     /// database, revert journal, and transaction-initial base warm set).
     #[inline]
     pub(crate) const fn new(
-        address: Address,
+        address: &'a Address,
         storage: &'a mut StorageOverlay,
+        created: bool,
         inner: &'a mut StateInner<'db>,
     ) -> Self {
-        Self { address, storage, inner }
+        Self { address, storage, created, inner }
     }
 
     /// Returns the account address.
     #[inline]
     pub const fn address(&self) -> Address {
-        self.address
+        *self.address
     }
 
     /// Returns whether the account's storage is marked for a full wipe before individual slot
@@ -130,7 +158,7 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
     #[inline]
     pub fn is_warm(&self, key: &Word) -> bool {
         self.storage.slots.get(key).is_some_and(|slot| slot.is_warm)
-            || self.inner.prewarm_set.is_storage_warm(&self.address, key)
+            || self.inner.prewarm_set.is_storage_warm(self.address, key)
     }
 
     /// Loads a storage slot without skipping cold accesses and returns a journaled handle.
@@ -166,36 +194,66 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
         key: Word,
         skip_cold_load: bool,
     ) -> Result<StorageSlotHandle<'a, 'db>, LoadError> {
-        let Self { address, storage, inner } = self;
-        let slot = match storage.slots.entry(key) {
+        self.into_slot_inner::<false>(key, skip_cold_load).map(|(slot, _)| slot)
+    }
+
+    /// Loads a storage slot, marks it warm, and returns whether this access was cold.
+    ///
+    /// This combines slot loading and EIP-2929 warmth handling so callers do not need to consult
+    /// the base warm set once while loading and again while warming the returned handle.
+    #[inline]
+    pub fn into_slot_with_skip_and_warm(
+        self,
+        key: Word,
+        skip_cold_load: bool,
+    ) -> Result<(StorageSlotHandle<'a, 'db>, bool), LoadError> {
+        self.into_slot_inner::<true>(key, skip_cold_load)
+    }
+
+    #[inline(always)]
+    fn into_slot_inner<const WARM: bool>(
+        self,
+        key: Word,
+        skip_cold_load: bool,
+    ) -> Result<(StorageSlotHandle<'a, 'db>, bool), LoadError> {
+        let Self { address, storage, created, inner } = self;
+        let (slot, is_cold) = match storage.slots.entry(key) {
             hash_map::Entry::Occupied(entry) => {
                 // An already-loaded slot has no cold database read to skip, so the skip only
                 // signals an unaffordable *cold* access. Runtime warmth (`is_warm`, seeded from
                 // the prewarm set on load) decides coldness: a slot warmed earlier this execution
                 // is a cheap warm access and must not be forced out of gas.
                 let slot = entry.into_mut();
-                if skip_cold_load
-                    && !slot.is_warm
-                    && !inner.prewarm_set.is_storage_warm(&address, &key)
-                {
+                let is_cold = if WARM || skip_cold_load {
+                    !slot.is_warm && !inner.prewarm_set.is_storage_warm(address, &key)
+                } else {
+                    false
+                };
+                if skip_cold_load && is_cold {
                     return Err(LoadError::ColdLoadSkipped);
                 }
-                slot
+                (slot, is_cold)
             }
             hash_map::Entry::Vacant(entry) => {
-                let is_warm = inner.prewarm_set.is_storage_warm(&address, &key);
+                let is_warm = inner.prewarm_set.is_storage_warm(address, &key);
                 if skip_cold_load && !is_warm {
                     return Err(LoadError::ColdLoadSkipped);
                 }
-                let value = if storage.wiped {
+                // Like revm, an unloaded slot of a created account reads zero without a database
+                // read, since the creation discards the address's old storage.
+                let value = if storage.wiped || created {
                     Word::ZERO
                 } else {
-                    inner.database.get_storage(&address, &key)?
+                    inner.database.get_storage(address, &key)?
                 };
-                entry.insert(StorageSlot::loaded(value, is_warm))
+                (entry.insert(StorageSlot::loaded(value, is_warm)), !is_warm)
             }
         };
-        Ok(StorageSlotHandle { address, key, slot, inner })
+        if WARM && is_cold {
+            slot.is_warm = true;
+            inner.push_journal(|| JournalEntry::StorageWarmed { address: *address, key });
+        }
+        Ok((StorageSlotHandle { address, key, slot, inner }, is_cold))
     }
 
     /// Marks all of the account's prior persistent storage as deleted.
@@ -209,6 +267,15 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
     #[inline]
     pub fn wipe(&mut self) {
         self.storage.wiped = true;
+        self.zero_loaded();
+    }
+
+    /// Resets every loaded slot to zero, keeping the account's unloaded storage.
+    ///
+    /// Like [`Self::wipe`], this is only called during transaction finalization, so it is not
+    /// journaled.
+    #[inline]
+    pub(crate) fn zero_loaded(&mut self) {
         self.storage.slots.iter_mut().for_each(|(_, slot)| {
             slot.value.set_current(Word::ZERO);
         });
@@ -229,7 +296,7 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
 #[derive_where(Debug)]
 pub struct StorageSlotHandle<'a, 'db> {
     /// Address of the account that owns the slot.
-    address: Address,
+    address: &'a Address,
     /// Storage key of the slot.
     key: Word,
     /// The slot's loaded overlay entry: its tracked value and runtime warmth.
@@ -243,7 +310,7 @@ impl StorageSlotHandle<'_, '_> {
     /// Returns the account address.
     #[inline]
     pub const fn address(&self) -> Address {
-        self.address
+        *self.address
     }
 
     /// Returns the storage key.
@@ -275,7 +342,7 @@ impl StorageSlotHandle<'_, '_> {
     /// execution.
     #[inline]
     pub fn is_warm(&self) -> bool {
-        self.slot.is_warm || self.inner.prewarm_set.is_storage_warm(&self.address, &self.key)
+        self.slot.is_warm || self.inner.prewarm_set.is_storage_warm(self.address, &self.key)
     }
 
     /// Marks the slot warm for EIP-2929 gas accounting, recording a [`JournalEntry::StorageWarmed`]
@@ -290,8 +357,7 @@ impl StorageSlotHandle<'_, '_> {
         }
         self.slot.is_warm = true;
         self.inner
-            .journal
-            .push(JournalEntry::StorageWarmed { address: self.address, key: self.key });
+            .push_journal(|| JournalEntry::StorageWarmed { address: *self.address, key: self.key });
         true
     }
 
@@ -304,8 +370,8 @@ impl StorageSlotHandle<'_, '_> {
             return;
         }
         self.slot.value.current = value;
-        self.inner.journal.push(JournalEntry::StorageChange {
-            address: self.address,
+        self.inner.push_journal(|| JournalEntry::StorageChange {
+            address: *self.address,
             key: self.key,
             previous,
         });
@@ -399,14 +465,18 @@ mod tests {
         state.prewarm_storage_slot(&account, warm_key);
         state.storage_slot(&account, cold_key).unwrap().write(Word::from(5));
 
-        state.storage(&account).wipe();
+        state.storage(&account).unwrap().wipe();
         assert!(state.storage_slot(&account, warm_key).unwrap().is_warm());
         assert!(!state.storage_slot(&account, cold_key).unwrap().is_warm());
         assert_eq!(state.storage_slot(&account, warm_key).unwrap().current(), Word::ZERO);
         assert_eq!(state.storage_slot(&account, cold_key).unwrap().current(), Word::ZERO);
 
         let pending = state.take_pending_state();
-        let overlay = pending.storage.get(&account).expect("wipe must be emitted");
+        let overlay = pending
+            .accounts
+            .get(&account)
+            .map(|account| &account.storage)
+            .expect("wipe must be emitted");
         assert!(overlay.wiped);
         assert!(overlay.changed_slots().next().is_none());
     }
@@ -422,7 +492,7 @@ mod tests {
 
         let checkpoint = state.checkpoint();
         {
-            let mut slot = state.storage(&address).into_slot(key).unwrap();
+            let mut slot = state.storage_slot(&address, key).unwrap();
             assert_eq!(slot.current(), Word::from(10));
             assert_eq!(slot.original(), Word::from(10));
             assert!(slot.warm(), "first access is cold");
@@ -451,12 +521,51 @@ mod tests {
 
         let checkpoint = state.checkpoint();
         {
-            let slot = state.storage(&address).into_slot(key).unwrap();
+            let slot = state.storage_slot(&address, key).unwrap();
             assert_eq!(slot.current(), Word::from(5));
         }
         // Loading caches the value but a read-only handle records no transition.
         state.rollback(checkpoint, Version::base(SpecId::FRONTIER).features);
         assert!(!state.take_pending_state().is_changed());
+    }
+
+    #[test]
+    fn fused_slot_load_warms_once_and_reverts() {
+        let address = Address::from([0x35; 20]);
+        let key = Word::from(8);
+        let mut state = State::new(CacheDB::default());
+        let checkpoint = state.checkpoint();
+
+        assert!(matches!(
+            state.storage(&address).unwrap().into_slot_with_skip_and_warm(key, true),
+            Err(LoadError::ColdLoadSkipped)
+        ));
+        assert!(!state.storage(&address).unwrap().is_loaded(&key));
+
+        let (slot, is_cold) =
+            state.storage(&address).unwrap().into_slot_with_skip_and_warm(key, false).unwrap();
+        assert!(is_cold);
+        assert_eq!(slot.current(), Word::ZERO);
+        assert!(state.storage_slot(&address, key).unwrap().is_warm());
+
+        state.rollback(checkpoint, Version::base(SpecId::FRONTIER).features);
+        assert!(!state.storage_slot(&address, key).unwrap().is_warm());
+    }
+
+    #[test]
+    fn fused_slot_load_honors_prewarm_added_after_loading() {
+        let address = Address::with_last_byte(1);
+        let key = Word::from(8);
+        let mut state = State::new(CacheDB::default());
+        state.storage_slot(&address, key).unwrap();
+        state.prewarm_storage_slot(&address, key);
+        let checkpoint = state.checkpoint();
+
+        let (slot, is_cold) =
+            state.storage(&address).unwrap().into_slot_with_skip_and_warm(key, true).unwrap();
+        assert!(!is_cold);
+        assert!(slot.is_warm());
+        assert_eq!(state.checkpoint(), checkpoint);
     }
 
     #[test]
@@ -470,18 +579,18 @@ mod tests {
 
         // A cold, not-yet-loaded slot reports neither loaded nor warm without touching the
         // database.
-        assert!(!state.storage(&address).is_loaded(&key));
-        assert!(!state.storage(&address).is_warm(&key));
+        assert!(!state.storage(&address).unwrap().is_loaded(&key));
+        assert!(!state.storage(&address).unwrap().is_warm(&key));
 
         // Loading materializes the slot with its database value; warming marks it warm.
         {
-            let mut slot = state.storage(&address).into_slot(key).unwrap();
+            let mut slot = state.storage_slot(&address, key).unwrap();
             assert_eq!(slot.current(), Word::from(42));
             assert!(slot.warm(), "first access is cold");
             assert!(!slot.warm(), "second access is warm");
         }
-        assert!(state.storage(&address).is_loaded(&key));
-        assert!(state.storage(&address).is_warm(&key));
+        assert!(state.storage(&address).unwrap().is_loaded(&key));
+        assert!(state.storage(&address).unwrap().is_warm(&key));
     }
 
     #[test]

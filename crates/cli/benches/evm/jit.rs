@@ -2,7 +2,7 @@ use crate::fixture::Suites;
 use alloy_primitives::{B256, hex};
 use criterion::{BatchSize, BenchmarkGroup, black_box, measurement::WallTime};
 use evm2::{
-    BaseEvmTypes, Evm, ExecutionConfig, InterpreterRunner, Precompiles, SpecId,
+    BaseEvmTypes, Evm, InterpreterRunner, Precompiles, SpecId,
     env::BlockEnv,
     ethereum::{RecoveredTxEnvelope, ethereum_tx_registry},
     evm::InMemoryDB,
@@ -25,17 +25,30 @@ const SKIP_COMPILE_JIT: &[&str] = &[
     "univ2_router",
     "airdrop",
     "usdc_proxy",
+    "universal_router",
+    "aggregation_router_v6",
+    "uniswap_v3_pool",
+    "uniswap_v4_pool_manager",
+    "curve_3pool",
+    "curve_tricrypto2",
+    "balancer_vault",
+    "succinct_staking",
 ];
 const SKIP_ALL: &[&str] = &["seaport", "snailtracer"];
 
 #[derive(Debug)]
 pub(crate) struct Compiler {
     compiler: LlvmCompiler,
+    /// Functions compiled so far, shared by fixtures that contain the same contract.
+    functions: HashMap<(B256, SpecId), EvmCompilerFn>,
 }
 
 impl Compiler {
     pub(crate) fn new() -> Self {
-        Self { compiler: EvmCompiler::new_llvm(false).expect("LLVM JIT compiler must initialize") }
+        Self {
+            compiler: EvmCompiler::new_llvm(false).expect("LLVM JIT compiler must initialize"),
+            functions: HashMap::new(),
+        }
     }
 }
 
@@ -70,17 +83,17 @@ impl PreparedBench {
 
         let mut functions = HashMap::new();
         for account in accounts {
-            if functions.contains_key(&account.code_hash) {
-                continue;
-            }
-            let name = format!("contract_{}", hex::encode(account.code_hash));
-            let func = unsafe {
-                compiler.compiler.jit(&name, account.bytecode.as_ref(), spec).unwrap_or_else(
-                    |err| panic!("{} benchmark JIT compilation failed: {err:?}", bench.name),
-                )
-            };
+            let func = *compiler.functions.entry((account.code_hash, spec)).or_insert_with(|| {
+                let name = format!("contract_{}_{spec:?}", hex::encode(account.code_hash));
+                let func = unsafe {
+                    compiler.compiler.jit(&name, account.bytecode.as_ref(), spec).unwrap_or_else(
+                        |err| panic!("{} benchmark JIT compilation failed: {err:?}", bench.name),
+                    )
+                };
+                compiler.compiler.clear_ir().expect("benchmark JIT compiler IR must clear");
+                func
+            });
             functions.insert(account.code_hash, func);
-            compiler.compiler.clear_ir().expect("benchmark JIT compiler IR must clear");
         }
 
         Some(Self {
@@ -192,12 +205,15 @@ struct FixedJitRunner {
 impl InterpreterRunner<BaseEvmTypes> for FixedJitRunner {
     fn run<'frame, 'host>(
         &self,
-        config: &ExecutionConfig<BaseEvmTypes>,
         interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &mut Evm<'host, BaseEvmTypes>,
     ) -> Option<InstrStop> {
+        // Compiled code treats the remaining gas as signed, so it cannot hold more than `i64::MAX`.
+        if interpreter.gas().remaining() > i64::MAX as u64 {
+            return None;
+        }
         let func = *self.functions.get(&interpreter.original_bytecode_hash())?;
-        interpreter.prepare_run(config.base_spec_id(), config.version(), host);
+        interpreter.prepare_run(host);
         Some(unsafe { func.call_with_interpreter(interpreter) })
     }
 }

@@ -87,8 +87,9 @@ pub struct TracingInspectorConfig {
     pub record_logs: bool,
     /// Whether to record immediate bytes for opcodes.
     pub record_immediate_bytes: bool,
-    /// Whether to record the deltas of each step: the memory and storage it writes and the
-    /// remaining gas after returning from a call or gaining gas.
+    /// Whether to record the deltas of each step: the memory it writes or an `MLOAD` reads, the
+    /// storage an `SSTORE` writes, and the remaining gas after returning from a call or gaining
+    /// gas.
     ///
     /// Required for parity `vmTrace`.
     pub record_step_deltas: bool,
@@ -221,7 +222,7 @@ impl TracingInspectorConfig {
     pub fn from_geth_config(config: &GethDefaultTracingOptions) -> Self {
         Self {
             step_limit: config.limit.and_then(NonZeroU64::new),
-            record_memory_snapshots: config.enable_memory.unwrap_or_default(),
+            record_memory_snapshots: config.is_memory_enabled(),
             record_stack_snapshots: if config.disable_stack.unwrap_or_default() {
                 StackSnapshotType::None
             } else {
@@ -639,5 +640,28 @@ mod tests {
         let config = TracingInspectorConfig::all();
         assert_eq!(config.record_stack_snapshots, StackSnapshotType::All);
         assert!(config.record_stack_snapshots.is_all());
+    }
+
+    #[test]
+    fn test_geth_config_memory_snapshots() {
+        for (enable_memory, disable_memory, expected) in [
+            (None, None, false),
+            (Some(true), None, true),
+            (Some(false), None, false),
+            (None, Some(false), true),
+            (None, Some(true), false),
+            (Some(true), Some(true), true),
+            (Some(false), Some(false), false),
+        ] {
+            let config = TracingInspectorConfig::from_geth_config(&GethDefaultTracingOptions {
+                enable_memory,
+                disable_memory,
+                ..Default::default()
+            });
+            assert_eq!(
+                config.record_memory_snapshots, expected,
+                "enable_memory={enable_memory:?}, disable_memory={disable_memory:?}"
+            );
+        }
     }
 }

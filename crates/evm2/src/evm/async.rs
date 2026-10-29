@@ -20,7 +20,14 @@ type Yield = ();
 type Complete<R> = AsyncResult<R>;
 type EvmFiber<R> = Coroutine<Resume, Yield, Complete<R>, DefaultStack>;
 
-const DEFAULT_STACK_SIZE: usize = 1024 * 1024;
+/// Fiber stack size, large enough for nested calls to reach the 1024 call depth limit.
+///
+/// Calls recurse on the native stack. Before EIP-150 a call can forward almost all of its gas, so a
+/// self-calling contract reaches the depth limit with about 5.3M gas. Running such a transaction
+/// with 1025 frames needs at least about 1.0 MiB of stack in release builds, 1.6 MiB with an
+/// inspector, and 5.6 MiB with an inspector at opt-level 0 (about 5.5 KiB per frame). The stack is
+/// reserved with `mmap` and committed lazily, so unused headroom only costs address space.
+const DEFAULT_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Reusable async EVM fiber stack storage.
 #[derive(Default)]
@@ -526,18 +533,21 @@ impl<D: AsyncDatabase + fmt::Debug> fmt::Debug for AsyncDb<D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncDatabase, AsyncDb, AsyncError, block_on_current, on_fiber};
+    use super::*;
     use crate::{
-        BaseEvmTypes, Evm, PrecompileError, Precompiles, SpecId, TxResult, TxResultExt,
+        BaseEvmTypes, Evm, ExecutionConfig, Inspector, PrecompileError, Precompiles, SpecId,
+        TxResult, TxResultExt, Version,
         bytecode::Bytecode,
+        constants::CALL_DEPTH_LIMIT,
         env::BlockEnvExt,
-        evm::{Database, Db, DynDatabase, InMemoryDB, PrecompileProvider, SystemTx},
-        interpreter::{GasTracker, Message, Word, op},
+        evm::{AccountInfo, Database, Db, DynDatabase, InMemoryDB, PrecompileProvider, SystemTx},
+        interpreter::{GasTracker, InstrStop, Interpreter, Message, MessageResult, Word, op},
         precompile::PrecompileOutput,
+        precompiles::PrecompileId,
         registry::{HandlerError, HandlerResult, TxRegistry, TxRequest, handler},
     };
     use alloy_consensus::{TxLegacy, transaction::Recovered};
-    use alloy_primitives::{Address, B256, Bytes, TxKind};
+    use alloy_primitives::{Address, B256, Bytes, TxKind, hex};
     use core::{
         assert_matches, convert::Infallible, fmt, future::Future, pin::Pin, ptr::NonNull,
         task::Poll,
@@ -993,6 +1003,99 @@ mod tests {
         assert!(saw_cancel);
     }
 
+    #[rstest::rstest]
+    #[case(0)]
+    #[case(7)]
+    #[case(u16::MAX - CALL_DEPTH_LIMIT - 1)]
+    fn transact_async_reaches_call_depth_limit(#[case] initial_call_depth: u16) {
+        #[derive(Default)]
+        struct DepthInspector {
+            calls: Vec<u16>,
+            writes: Vec<u16>,
+            too_deep: usize,
+        }
+
+        impl Inspector<BaseEvmTypes> for DepthInspector {
+            fn call(
+                &mut self,
+                _: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.calls.push(message.depth);
+                None
+            }
+
+            fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if interp.opcode() == op::SSTORE {
+                    self.writes.push(interp.message().depth);
+                }
+            }
+
+            fn call_end(
+                &mut self,
+                _: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                _: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                self.too_deep += usize::from(result.stop == InstrStop::CallTooDeep);
+            }
+        }
+
+        let caller = Address::from([0xaa; 20]);
+        let target = Address::from([0x11; 20]);
+        // SLOAD 0, add 1, SSTORE 0, then CALL self with all but 1024 gas remaining.
+        let code = Bytecode::new_legacy(Bytes::from_static(&hex!(
+            "60005460010160005560006000600060006000306104005a03f100"
+        )));
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &caller,
+            AccountInfo::default().with_balance(Word::from(10).pow(Word::from(18))),
+        );
+        database.insert_account_info(
+            &target,
+            AccountInfo { nonce: 1, ..AccountInfo::default().with_code(code) },
+        );
+        let mut version = Version::new(SpecId::FRONTIER);
+        version.initial_call_depth = initial_call_depth;
+        let mut evm = Evm::<BaseEvmTypes>::new_with_execution_config(
+            ExecutionConfig::for_spec_and_version(SpecId::FRONTIER, version),
+            SpecId::FRONTIER,
+            BlockEnvExt::default(),
+            crate::ethereum::ethereum_tx_registry(SpecId::FRONTIER),
+            database,
+            Precompiles::base(SpecId::FRONTIER),
+        );
+        evm.set_inspector(DepthInspector::default());
+        let tx = Recovered::new_unchecked(
+            crate::ethereum::TxEnvelope::Legacy(TxLegacy {
+                to: TxKind::Call(target),
+                gas_limit: 7_000_000,
+                ..TxLegacy::default()
+            }),
+            caller,
+        );
+
+        let result = poll_ready(evm.transact_async(&tx)).unwrap().commit();
+
+        assert!(result.status);
+        assert_eq!(result.tx_gas_used(), 5_291_175);
+        assert_eq!(
+            evm.state_mut().storage_slot_untracked(&target, &Word::ZERO).unwrap(),
+            Word::from(1025)
+        );
+        let inspector = evm.clear_inspector_as::<DepthInspector>().unwrap();
+        assert_eq!(
+            inspector.writes,
+            (initial_call_depth..=initial_call_depth + 1024).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            inspector.calls,
+            (initial_call_depth..=initial_call_depth + 1025).collect::<Vec<_>>()
+        );
+        assert_eq!(inspector.too_deep, 1);
+    }
+
     const TEST_TX_TYPE: u8 = 0x00;
 
     fn test_tx(value: u64) -> crate::ethereum::RecoveredTxEnvelope {
@@ -1091,6 +1194,10 @@ mod tests {
     }
 
     impl PrecompileProvider<BaseEvmTypes> for NonSendPrecompiles {
+        fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
+            Vec::new()
+        }
+
         fn contains(&self, _address: &Address) -> bool {
             let _ = Rc::strong_count(&self.marker);
             false

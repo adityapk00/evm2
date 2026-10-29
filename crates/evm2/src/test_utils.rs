@@ -10,7 +10,7 @@ use crate::{
     },
     storage_key::{StorageKey, StorageKeyMap},
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, vec::Vec};
 use alloy_primitives::{Address, B256, Bytes, Log};
 use core::{assert_matches, ops::Range};
 
@@ -33,6 +33,7 @@ impl EvmTypesHost for TestTypes {
 #[derive(Debug)]
 pub(crate) struct TestHost {
     pub(crate) spec_id: SpecId,
+    pub(crate) execution_config: ExecutionConfig<TestTypes>,
     pub(crate) block: BlockEnv<TestTypes>,
     pub(crate) code_hash: B256,
     pub(crate) code: Bytes,
@@ -59,6 +60,9 @@ impl Default for TestHost {
     fn default() -> Self {
         Self {
             spec_id: SpecId::OSAKA,
+            execution_config: ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(
+                SpecId::OSAKA,
+            ),
             block: BlockEnvExt::default(),
             code_hash: B256::ZERO,
             code: Bytes::new(),
@@ -89,6 +93,10 @@ impl Default for TestHost {
 impl Host<TestTypes> for TestHost {
     fn spec_id(&self) -> SpecId {
         self.spec_id
+    }
+
+    fn execution_config(&self) -> &ExecutionConfig<TestTypes> {
+        &self.execution_config
     }
 
     fn block_env(&mut self) -> &BlockEnv<TestTypes> {
@@ -190,8 +198,8 @@ impl Host<TestTypes> for TestHost {
         self.transient_storage.insert(StorageKey::new(*address, *key), *value);
     }
 
-    fn log(&mut self, log: Log) {
-        self.logs.push(log);
+    fn log(&mut self, address: &Address, topics: Cow<'_, [B256]>, data: Cow<'_, [u8]>) {
+        self.logs.push(Log::new_unchecked(*address, topics.into_owned(), data.into_owned().into()));
     }
 
     fn execute_message(
@@ -207,8 +215,7 @@ impl Host<TestTypes> for TestHost {
                 ..Default::default()
             });
         }
-        self.call_static_flags
-            .push(message.caller_is_static || message.kind == MessageKind::StaticCall);
+        self.call_static_flags.push(message.is_static());
         self.calls.push(message.clone());
         match self.execute_error.clone() {
             Some(error) => Err(error),
@@ -242,7 +249,7 @@ pub(crate) struct TestInterpreter {
 
 impl TestInterpreter {
     pub(crate) fn stack(&self) -> &[Word] {
-        unsafe { core::slice::from_raw_parts(self.stack.as_ptr().cast(), self.stack_len) }
+        unsafe { core::slice::from_raw_parts(self.stack.0.as_ptr().cast(), self.stack_len) }
     }
 
     pub(crate) fn memory(&mut self, offset: usize, len: usize) -> &[u8] {
@@ -339,8 +346,8 @@ pub(crate) fn run(config: RunConfig<'_>) -> TestInterpreter {
     let mut default_host = TestHost::default();
     let host = host.unwrap_or(&mut default_host);
     host.spec_id = spec_id;
-    let config = ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(spec_id);
-    let (err, execution_error) = match inner.run(&config, host) {
+    host.execution_config = ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(spec_id);
+    let (err, execution_error) = match inner.run(host) {
         Ok(stop) => (stop, None),
         Err(error) => (InstrStop::FatalExternalError, Some(error)),
     };

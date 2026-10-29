@@ -1,8 +1,8 @@
 //! Owned pending transaction state detached from the EVM.
 
 use super::{
-    Account, AccountChangeRef, AccountInfo, StateChangeSink, StateChangeSource, StorageChange,
-    StorageOverlay, StorageSlot, Tracked,
+    Account, AccountChanges, AccountFlags, AccountInfo, StateChangeSink, StateChangeSource,
+    StorageSlot, Tracked,
 };
 use crate::interpreter::Word;
 use alloy_primitives::{
@@ -32,11 +32,6 @@ pub struct PendingState {
     /// Accounts loaded by the transaction: transaction-boundary original info, present info, and
     /// account-lifetime flags.
     pub(crate) accounts: AddressMap<Account>,
-    /// Per-account storage overlays loaded by the transaction.
-    ///
-    /// Accounts whose storage was loaded are normally present in [`Self::accounts`] as well, since
-    /// executing an account loads it.
-    pub(crate) storage: AddressMap<StorageOverlay>,
     /// Accounts selfdestructed by the transaction.
     pub(crate) selfdestructs: AddressSet,
 }
@@ -45,7 +40,7 @@ impl PendingState {
     /// Returns whether the transaction loaded no accounts and no storage.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty() && self.storage.is_empty()
+        self.accounts.is_empty()
     }
 
     /// Returns the current account information when the account is present in pending state.
@@ -63,22 +58,35 @@ impl PendingState {
     ) {
         let code_changed = original.as_ref().map(|account| account.code_hash)
             != current.as_ref().map(|account| account.code_hash);
-        self.accounts.insert(
-            address,
-            Account { original, present: current, code_changed, ..Account::default() },
-        );
+        let flags = if code_changed { AccountFlags::CODE_CHANGED } else { AccountFlags::empty() };
+        let account = self.accounts.entry(address).or_default();
+        *account = Account {
+            original,
+            present: current,
+            flags,
+            storage: core::mem::take(&mut account.storage),
+        };
     }
 
     /// Inserts a storage slot's transaction-boundary original and current values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owning account has not been inserted with [`Self::insert_account`].
     pub fn insert_storage(&mut self, address: Address, key: Word, original: Word, current: Word) {
-        self.storage.entry(address).or_default().slots.insert(
-            key,
-            StorageSlot {
-                value: Tracked::from_parts(original, current),
-                is_warm: false,
-                _non_exhaustive: (),
-            },
-        );
+        self.accounts
+            .get_mut(&address)
+            .expect("insert the account before its storage")
+            .storage
+            .slots
+            .insert(
+                key,
+                StorageSlot {
+                    value: Tracked::from_parts(original, current),
+                    is_warm: false,
+                    _non_exhaustive: (),
+                },
+            );
     }
 
     /// Returns whether the transaction contains any account or storage change.
@@ -86,17 +94,30 @@ impl PendingState {
     /// Loaded-but-unchanged accounts and storage slots are ignored.
     #[cfg(test)]
     pub(crate) fn is_changed(&self) -> bool {
-        self.accounts.values().any(Account::is_changed)
-            || self
-                .storage
-                .values()
-                .any(|overlay| overlay.wiped || overlay.changed_slots().next().is_some())
+        self.accounts.values().any(|account| account.is_changed() || account.storage.is_changed())
+    }
+
+    /// Returns each loaded account's changes, in an unspecified account order.
+    #[inline]
+    pub fn account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
+        self.accounts.iter().map(|(&address, account)| {
+            account.changes(address, self.selfdestructs.contains(&address))
+        })
+    }
+
+    /// Returns the changes of the account at `address`, or `None` if the transaction did not load
+    /// it.
+    #[inline]
+    pub fn account_changes_for(&self, address: &Address) -> Option<AccountChanges<'_>> {
+        self.accounts
+            .get(address)
+            .map(|account| account.changes(*address, self.selfdestructs.contains(address)))
     }
 }
 
 impl StateChangeSource for PendingState {
-    /// Visits the transaction's loaded entries in an unspecified order: bytecode, then per-account
-    /// storage wipes, changed slots, and slot reads, then accounts.
+    /// Visits the transaction's loaded entries account by account, in an unspecified account
+    /// order. Each account's bytecode and storage precede its metadata.
     ///
     /// The same code hash may be visited more than once when several accounts share bytecode; sinks
     /// key bytecode by hash, so repeated visits are idempotent.
@@ -105,42 +126,8 @@ impl StateChangeSource for PendingState {
     /// unchanged — go through [`StateChangeSink::account`]; loaded-but-unchanged entries go
     /// through the read callbacks.
     fn visit<S: StateChangeSink>(&self, sink: &mut S) -> Result<(), S::Error> {
-        for (code_hash, code) in self.accounts.values().filter_map(Account::changed_code) {
-            sink.bytecode(code_hash, code)?;
-        }
-
-        for (&address, overlay) in &self.storage {
-            if overlay.wiped {
-                sink.storage_wipe(address)?;
-            }
-            for (&key, slot) in &overlay.slots {
-                let value = &slot.value;
-                if slot.is_changed(overlay.wiped) {
-                    sink.storage(StorageChange {
-                        address,
-                        key,
-                        original: value.original,
-                        current: value.current,
-                    })?;
-                } else {
-                    sink.storage_read(address, key, value.current)?;
-                }
-            }
-        }
-
-        for (&address, entry) in &self.accounts {
-            let selfdestructed = self.selfdestructs.contains(&address);
-            if entry.is_changed() || entry.is_created() || selfdestructed {
-                sink.account(AccountChangeRef {
-                    address,
-                    original: entry.original.as_ref(),
-                    current: entry.present.as_ref(),
-                    created: entry.is_created(),
-                    selfdestructed,
-                })?;
-            } else {
-                sink.account_read(address, entry.present.as_ref())?;
-            }
+        for changes in self.account_changes() {
+            changes.visit(sink)?;
         }
         Ok(())
     }
@@ -165,8 +152,36 @@ mod tests {
         assert_eq!(state.accounts[&address].original, Some(original));
         assert_eq!(state.accounts[&address].present, Some(current));
         assert_eq!(
-            state.storage[&address].slots[&key].value,
+            state.accounts[&address].storage.slots[&key].value,
             Tracked::from_parts(Word::from(2), Word::from(3))
         );
+    }
+
+    #[test]
+    fn account_changes_for_looks_up_one_address() {
+        let changed = Address::with_last_byte(0xaa);
+        let unchanged = Address::with_last_byte(0xbb);
+        let info = AccountInfo { nonce: 1, ..AccountInfo::default() };
+        let mut state = PendingState::default();
+        state.insert_account(
+            changed,
+            Some(info.clone()),
+            Some(AccountInfo { nonce: 2, ..info.clone() }),
+        );
+        state.insert_account(unchanged, Some(info.clone()), Some(info.clone()));
+        let destroyed = Address::with_last_byte(0xdd);
+        state.insert_account(destroyed, Some(info.clone()), Some(info));
+        state.selfdestructs.insert(destroyed);
+
+        let changes = state.account_changes_for(&changed).unwrap();
+        assert_eq!(changes.address, changed);
+        assert!(changes.is_changed());
+        let changes = state.account_changes_for(&unchanged).unwrap();
+        assert_eq!(changes.address, unchanged);
+        assert!(!changes.is_changed());
+        let changes = state.account_changes_for(&destroyed).unwrap();
+        assert!(changes.selfdestructed);
+        assert!(changes.is_changed());
+        assert!(state.account_changes_for(&Address::with_last_byte(0xcc)).is_none());
     }
 }

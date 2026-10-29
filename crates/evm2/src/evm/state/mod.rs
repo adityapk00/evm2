@@ -12,7 +12,7 @@ mod stream;
 mod tracked;
 
 pub(crate) use account::Account;
-pub use account::{AccountHandle, AccountInfo};
+pub use account::{AccountFlags, AccountHandle, AccountInfo};
 pub use block::BlockStateAccumulator;
 #[cfg(feature = "account-ext")]
 pub use extension::AccountExtension;
@@ -20,14 +20,15 @@ pub use journal::{JournalEntry, StateCheckpoint};
 pub use pending::PendingState;
 pub use storage::{StorageHandle, StorageOverlay, StorageSlot, StorageSlotHandle};
 pub use stream::{
-    AccountChangeRef, NoopChangeSink, StateChangeSink, StateChangeSource, StorageChange, Tee,
+    AccountChangeRef, AccountChanges, NoopChangeSink, StateChangeSink, StateChangeSource,
+    StorageChange, Tee,
 };
 pub use tracked::Tracked;
 
 use super::{
     PrewarmSet,
-    bal::{Bal, BlockAccessIndex},
-    db::{CacheDB, DbResult, DynDatabase, EmptyDB, boxed_dyn_database},
+    bal::{Bal, BalContext, BlockAccessIndex},
+    db::{Cache, CacheDB, DbResult, DynDatabase, EmptyDB, boxed_dyn_database},
 };
 use crate::{
     EvmFeatures, LoadError, Version,
@@ -52,14 +53,51 @@ use derive_where::derive_where;
 pub struct State<'a> {
     /// Account writes plus touch and warm-access metadata for the current transaction.
     accounts: AddressMap<Account>,
-    /// Persistent storage writes plus warm slot metadata for the current transaction.
-    storage: AddressMap<StorageOverlay>,
     /// Empty slot-map allocations retained between transactions, under fixed capacity limits.
     storage_pool: storage_pool::StoragePool,
     /// Transaction-scoped EIP-1153 transient storage keyed by account address and slot.
     transient_storage: StorageKeyMap<Word>,
     /// Inner state.
     inner: StateInner<'a>,
+}
+
+/// Owned in-memory state without a backing database.
+///
+/// This can be kept across executions or sent to another thread. Restoring it requires supplying
+/// the database that should serve uncached reads.
+#[derive(Clone, Debug)]
+pub struct StateSnapshot {
+    accounts: AddressMap<Account>,
+    transient_storage: StorageKeyMap<Word>,
+    cache: Cache,
+    bal_context: BalContext,
+    prewarm_set: PrewarmSet,
+    journal: Vec<JournalEntry>,
+    logs: Vec<Log>,
+    selfdestructs: AddressSet,
+}
+
+impl StateSnapshot {
+    /// Restores the captured state over a backing database.
+    pub fn into_state<'a>(self, db: impl DynDatabase + 'a) -> State<'a> {
+        State {
+            accounts: self.accounts,
+            storage_pool: storage_pool::StoragePool::default(),
+            transient_storage: self.transient_storage,
+            inner: StateInner {
+                database: CacheDB {
+                    cache: self.cache,
+                    db: boxed_dyn_database(db),
+                    bal_context: self.bal_context,
+                    _non_exhaustive: (),
+                },
+                prewarm_set: self.prewarm_set,
+                journal: self.journal,
+                logs: self.logs,
+                selfdestructs: self.selfdestructs,
+            },
+        }
+    }
 }
 
 /// Clones in-memory state with [`EmptyDB`] as the backing database.
@@ -71,25 +109,50 @@ impl Clone for State<'_> {
 }
 
 impl State<'_> {
+    /// Captures all in-memory state without retaining the backing database.
+    pub fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            accounts: self.accounts.clone(),
+            transient_storage: self.transient_storage.clone(),
+            cache: self.database.cache.clone(),
+            bal_context: self.database.bal_context.clone(),
+            prewarm_set: self.prewarm_set.clone(),
+            journal: self.journal.clone(),
+            logs: self.logs.clone(),
+            selfdestructs: self.selfdestructs.clone(),
+        }
+    }
+
     /// Clones in-memory state with `db` as the backing database.
     pub fn clone_with<'a>(&self, db: impl DynDatabase + 'a) -> State<'a> {
+        self.snapshot().into_state(db)
+    }
+
+    /// Returns a state over `db` whose accepted overlay is this state's accepted overlay with the
+    /// current transaction's writes committed, and whose transaction scratch is empty.
+    ///
+    /// This is `clone_with` followed by [`Self::commit_transaction`] and
+    /// [`Self::clear_transaction_state`], without copying the journal, logs, transient storage or
+    /// pre-warmed set, so its cost does not grow with the running transaction's journal. Use it as
+    /// the base state of a transaction nested in the running one.
+    pub fn committed_copy<'a>(&self, db: impl DynDatabase + 'a) -> State<'a> {
+        let mut database = CacheDB {
+            cache: self.database.cache.clone(),
+            db: boxed_dyn_database(db),
+            bal_context: self.database.bal_context.clone(),
+            _non_exhaustive: (),
+        };
+        database.commit(&self.accounts);
         State {
-            accounts: self.accounts.clone(),
-            storage: self.storage.clone(),
-            // The pool holds only spare allocations, not state.
+            accounts: AddressMap::default(),
             storage_pool: storage_pool::StoragePool::default(),
-            transient_storage: self.transient_storage.clone(),
+            transient_storage: StorageKeyMap::default(),
             inner: StateInner {
-                database: CacheDB {
-                    cache: self.database.cache.clone(),
-                    db: boxed_dyn_database(db),
-                    bal_context: self.database.bal_context.clone(),
-                    _non_exhaustive: (),
-                },
-                prewarm_set: self.prewarm_set.clone(),
-                journal: self.journal.clone(),
-                logs: self.logs.clone(),
-                selfdestructs: self.selfdestructs.clone(),
+                database,
+                journal: Vec::new(),
+                logs: Vec::new(),
+                selfdestructs: AddressSet::default(),
+                prewarm_set: PrewarmSet::new(),
             },
         }
     }
@@ -122,14 +185,32 @@ pub struct StateInner<'a> {
     /// Database plus accepted transaction-boundary state overlay.
     #[derive_where(skip)]
     database: CacheDB<Box<dyn DynDatabase + 'a>>,
-    /// Pre-warmed set: precompiles, coinbase, and the EIP-2930 access list.
-    prewarm_set: PrewarmSet,
     /// Revert journal.
     journal: Vec<JournalEntry>,
     /// Logs emitted by the current transaction.
     logs: Vec<Log>,
     /// Accounts self-destructed in the current transaction.
     selfdestructs: AddressSet,
+    /// Pre-warmed set: precompiles, coinbase, and the EIP-2930 access list.
+    prewarm_set: PrewarmSet,
+}
+
+impl StateInner<'_> {
+    /// Appends a journal entry, building it straight in the journal's buffer.
+    ///
+    /// `Vec::push` builds the entry on the stack, because it must survive a possible reallocation,
+    /// and then copies it with wide loads. Those loads cannot take their data from the narrower
+    /// stores that built the entry and stall until the stores reach the cache.
+    #[inline(always)]
+    fn push_journal(&mut self, entry: impl FnOnce() -> JournalEntry) {
+        self.journal.reserve(1);
+        let len = self.journal.len();
+        // SAFETY: `reserve` made room for one more entry.
+        unsafe {
+            self.journal.as_mut_ptr().add(len).write(entry());
+            self.journal.set_len(len + 1);
+        }
+    }
 }
 
 impl<'a> State<'a> {
@@ -141,15 +222,14 @@ impl<'a> State<'a> {
     pub(crate) fn new_mono(initial: Box<dyn DynDatabase + 'a>) -> Self {
         Self {
             accounts: AddressMap::default(),
-            storage: AddressMap::default(),
             storage_pool: storage_pool::StoragePool::default(),
             transient_storage: StorageKeyMap::default(),
             inner: StateInner {
                 database: CacheDB::new(initial),
-                prewarm_set: PrewarmSet::new(),
                 journal: Vec::new(),
                 logs: Vec::new(),
                 selfdestructs: AddressSet::default(),
+                prewarm_set: PrewarmSet::new(),
             },
         }
     }
@@ -177,6 +257,19 @@ impl<'a> State<'a> {
     pub fn set_initial(&mut self, initial: impl DynDatabase + 'a) {
         self.database = CacheDB::new(boxed_dyn_database(initial));
         self.clear_transaction_state();
+    }
+
+    /// Consumes the state and returns the current backing database, dropping every in-memory
+    /// layer.
+    ///
+    /// The in-memory layers — accepted state, the journal, and transaction scratch — are never
+    /// written through to the database, so nothing the EVM executed reaches it. The database
+    /// itself is returned as-is and may differ from the one passed to [`Self::new`]: it can be
+    /// replaced through [`Self::set_initial`], mutated through [`Self::initial_mut`], or
+    /// changed by its own reads.
+    #[inline]
+    pub fn into_db(self) -> Box<dyn DynDatabase + 'a> {
+        self.inner.database.db
     }
 
     /// Returns the accepted-state overlay database.
@@ -310,7 +403,18 @@ impl<'a> State<'a> {
     /// transaction. Use [`Self::storage_slot_untracked`] to read through to the database.
     #[inline]
     pub fn get_storage(&self, address: &Address, key: &Word) -> Option<Word> {
-        self.storage.get(address)?.slots.get(key).map(|slot| slot.value.current)
+        self.accounts.get(address)?.storage.slots.get(key).map(|slot| slot.value.current)
+    }
+
+    /// Returns the accounts in the transaction overlay, each with the keys of its loaded storage
+    /// slots.
+    ///
+    /// This includes accounts loaded as absent and slots that were only read. Overlay entries
+    /// survive [`Self::rollback`], so reads in reverted frames are included, as access-list
+    /// builders need. Accounts installed by [`Self::set_pending_state`] are included; entries of
+    /// the accepted-state overlay that the transaction did not load are not.
+    pub fn loaded_accounts(&self) -> impl Iterator<Item = (&Address, impl Iterator<Item = &Word>)> {
+        self.accounts.iter().map(|(address, account)| (address, account.storage.slots.keys()))
     }
 
     /// Sets the warmth of an already-loaded storage slot without journaling the change.
@@ -322,49 +426,24 @@ impl<'a> State<'a> {
     /// This call adds no journal entry; rolling back an existing storage-warming entry can
     /// still clear the slot's runtime warmth.
     pub fn set_storage_warm(&mut self, address: &Address, key: Word, warm: bool) {
-        if let Some(storage) = self.storage.get_mut(address)
-            && let Some(slot) = storage.slots.get_mut(&key)
+        if let Some(slot) =
+            self.accounts.get_mut(address).and_then(|account| account.storage.slots.get_mut(&key))
         {
             slot.is_warm = warm;
         }
     }
 
-    /// Copies one account's transaction overlay from another state.
+    /// Sets the warmth of an already-loaded account without journaling the change.
     ///
-    /// Does nothing when the source account is not loaded. Source slots overwrite matching target
-    /// slots; target-only slots are retained. Account metadata is copied, including original values
-    /// and lifecycle flags. This only updates the
-    /// in-flight transaction layer: accepted and backing database state must be transferred
-    /// separately, including any target-side committed storage wipe when the source transaction
-    /// overlay is not wiped. No database reads or journal entries are added; journals, logs,
-    /// pre-warmed sets and transient storage are left unchanged.
-    pub fn merge_transaction_account_from(&mut self, address: &Address, source: &State<'_>) {
-        let Some(account) = source.accounts.get(address) else { return };
-        self.accounts.insert(*address, account.clone());
-        if let Some(storage) = source.storage.get(address) {
-            let target = self.storage.entry(*address).or_default();
-            target.slots.extend(storage.slots.iter().map(|(key, slot)| (*key, *slot)));
-            target.wiped = storage.wiped;
-        }
-        if source.inner.selfdestructs.contains(address) {
-            self.inner.selfdestructs.insert(*address);
-        } else {
-            self.inner.selfdestructs.remove(address);
-        }
-    }
-
-    /// Clears a loaded account's touch status and its loaded slots' runtime warmth.
+    /// Does nothing for unloaded accounts and leaves account values, storage, and the pre-warmed
+    /// set unchanged. Addresses in the pre-warmed set remain effectively warm even when their
+    /// runtime warmth is cleared.
     ///
-    /// This does not load state, record journal entries, or change account warmth or the
-    /// pre-warmed set. Existing journal entries retain their normal rollback behavior.
-    pub fn clear_account_touch_and_storage_warmth(&mut self, address: &Address) {
+    /// This call adds no journal entry; rolling back an existing account-change entry still
+    /// restores the account's recorded runtime warmth.
+    pub fn set_account_warm(&mut self, address: &Address, warm: bool) {
         if let Some(account) = self.accounts.get_mut(address) {
-            account.is_touched = false;
-        }
-        if let Some(storage) = self.storage.get_mut(address) {
-            for slot in storage.slots.values_mut() {
-                slot.is_warm = false;
-            }
+            account.flags.set(AccountFlags::WARM, warm);
         }
     }
 
@@ -397,11 +476,12 @@ impl<'a> State<'a> {
         &self.inner.prewarm_set
     }
 
-    /// Returns the pre-warmed set mutably so callers can warm precompiles, the coinbase, the
-    /// EIP-2930 access list, or non-revertible base warm accounts/slots.
+    /// Returns the pre-warmed set mutably.
     ///
-    /// Entries added through this handle survive [`Self::rollback`] and are cleared per transaction
-    /// by [`Self::clear_transaction_state`].
+    /// This lets callers replace the set (`*state.prewarm_set_mut() = set`) or edit it in place,
+    /// for example with [`PrewarmSet::remove`] to cool an address for a simulated transaction
+    /// boundary. Changes are not journaled and leave the runtime warmth of loaded accounts and
+    /// slots unchanged.
     #[inline]
     pub const fn prewarm_set_mut(&mut self) -> &mut PrewarmSet {
         &mut self.inner.prewarm_set
@@ -427,26 +507,19 @@ impl<'a> State<'a> {
         self.prewarm_storage(address, [key]);
     }
 
-    /// Replaces the pre-warmed set wholesale.
-    ///
-    /// Use [`PrewarmSet`]'s warming methods to populate the set. The installed set survives
-    /// [`Self::rollback`] and is cleared per transaction by [`Self::clear_transaction_state`].
-    #[inline]
-    pub fn set_prewarm_set(&mut self, prewarm_set: PrewarmSet) {
-        self.inner.prewarm_set = prewarm_set;
-    }
-
     /// Clears transaction-scoped substate.
     pub fn clear_transaction_state(&mut self) {
         let Self {
             accounts,
-            storage,
             storage_pool,
             transient_storage,
             inner: StateInner { prewarm_set, journal, selfdestructs, logs, database: _ },
+            ..
         } = self;
+        for account in accounts.values_mut() {
+            storage_pool.clear_overlay(&mut account.storage);
+        }
         accounts.clear();
-        storage_pool.clear(storage);
         transient_storage.clear();
         prewarm_set.clear();
         journal.clear();
@@ -476,8 +549,6 @@ impl<'a> State<'a> {
     /// cold access without paying for the load. With `skip_cold` false (or when the account is
     /// warm) the entry is loaded.
     ///
-    /// A map entry exists only because it was loaded, so an occupied entry is returned as-is.
-    ///
     /// The load itself is not journaled: the loaded entry holds `original == present` and is a
     /// harmless read cache that [`Self::rollback`] leaves in place. Only later warmth and value
     /// changes are journaled and reverted.
@@ -491,11 +562,14 @@ impl<'a> State<'a> {
         match accounts.entry(*address) {
             hash_map::Entry::Occupied(entry) => {
                 // An already-loaded account has no cold database read to skip, so the skip only
-                // signals an unaffordable *cold* access. Runtime warmth (`is_warm`, seeded from
-                // the prewarm set on load) decides coldness: an account warmed earlier this
-                // execution is a cheap warm access and must not be forced out of gas.
+                // signals an unaffordable *cold* access. Runtime warmth (`AccountFlags::WARM`,
+                // seeded from the prewarm set on load) decides coldness: an account warmed earlier
+                // this execution is a cheap warm access and must not be forced out of gas.
                 let account = entry.into_mut();
-                if skip_cold && !account.is_warm && !inner.prewarm_set.is_warm(address) {
+                if skip_cold
+                    && !account.flags.contains(AccountFlags::WARM)
+                    && !inner.prewarm_set.is_warm(address)
+                {
                     return Err(LoadError::ColdLoadSkipped);
                 }
                 Ok(account)
@@ -507,7 +581,12 @@ impl<'a> State<'a> {
                 }
                 let original = inner.database.get_account(address)?;
                 let present = original.clone();
-                Ok(entry.insert(Account { original, present, is_warm, ..Account::default() }))
+                Ok(entry.insert(Account {
+                    original,
+                    present,
+                    flags: if is_warm { AccountFlags::WARM } else { AccountFlags::empty() },
+                    ..Account::default()
+                }))
             }
         }
     }
@@ -522,8 +601,9 @@ impl<'a> State<'a> {
     ///
     /// Cold accounts are always loaded. Use [`Self::account_with_skip`] to skip them.
     pub fn account(&mut self, address: &Address) -> DbResult<AccountHandle<'_, 'a>> {
-        Self::account_raw(&mut self.inner, &mut self.accounts, address)
-            .map(|tracked| AccountHandle::new(*address, tracked, &mut self.inner))
+        let State { accounts, storage_pool, inner, .. } = self;
+        Self::account_raw(inner, accounts, address)
+            .map(|tracked| AccountHandle::new(*address, tracked, inner, storage_pool))
     }
 
     /// Loads an account, optionally skipping a cold access before reading the database.
@@ -536,49 +616,35 @@ impl<'a> State<'a> {
         address: &Address,
         skip_cold_load: bool,
     ) -> Result<AccountHandle<'_, 'a>, LoadError> {
-        Self::account_raw_with_skip(&mut self.inner, &mut self.accounts, address, skip_cold_load)
-            .map(|tracked| AccountHandle::new(*address, tracked, &mut self.inner))
+        let State { accounts, storage_pool, inner, .. } = self;
+        Self::account_raw_with_skip(inner, accounts, address, skip_cold_load)
+            .map(|tracked| AccountHandle::new(*address, tracked, inner, storage_pool))
     }
 
-    /// Returns a journaled mutation handle to `address`'s persistent storage overlay.
+    /// Loads the owning account and returns a journaled handle to its persistent storage.
     ///
-    /// The returned [`StorageHandle`] ties the account's storage slots to the revert journal, so
-    /// any slot warmed or written through it is undone together by [`Self::rollback`]. Slot values
-    /// are read from the backing database lazily, only when a slot is loaded or first written. This
-    /// mirrors [`Self::account`] on the storage side.
-    ///
-    /// This does not load or touch the owning account; callers that need the account materialized
-    /// must do so separately via [`Self::account`].
-    pub fn storage(&mut self, address: &Address) -> StorageHandle<'_, 'a> {
-        let storage_pool = &mut self.storage_pool;
-        let storage = self.storage.entry(*address).or_insert_with(|| StorageOverlay {
-            slots: storage_pool.take(),
-            ..StorageOverlay::default()
-        });
-        StorageHandle::new(*address, storage, &mut self.inner)
+    /// Loading account metadata neither touches nor warms the account. Slot values remain lazy;
+    /// loading or warming a slot records the same journal entries as [`AccountHandle::storage`].
+    #[inline(always)]
+    pub fn storage<'s>(&'s mut self, address: &'s Address) -> DbResult<StorageHandle<'s, 'a>> {
+        let State { accounts, storage_pool, inner, .. } = self;
+        let account = Self::account_raw(inner, accounts, address)?;
+        if account.storage.slots.capacity() == 0 {
+            account.storage.slots = storage_pool.take();
+        }
+        let discards_storage = account.discards_storage();
+        Ok(StorageHandle::new(address, &mut account.storage, discards_storage, inner))
     }
 
     /// Loads a single persistent storage slot and returns a journaled mutation handle.
     ///
     /// Cold slots are always loaded. See [`StorageHandle::into_slot`] for loading semantics.
-    pub fn storage_slot(
-        &mut self,
-        address: &Address,
+    pub fn storage_slot<'s>(
+        &'s mut self,
+        address: &'s Address,
         key: Word,
-    ) -> DbResult<StorageSlotHandle<'_, 'a>> {
-        self.storage(address).into_slot(key)
-    }
-
-    /// Loads a storage slot, optionally skipping a cold access before reading the database.
-    ///
-    /// See [`StorageHandle::into_slot_with_skip`] for the cold-load skipping semantics.
-    pub fn storage_slot_with_skip(
-        &mut self,
-        address: &Address,
-        key: Word,
-        skip_cold_load: bool,
-    ) -> Result<StorageSlotHandle<'_, 'a>, LoadError> {
-        self.storage(address).into_slot_with_skip(key, skip_cold_load)
+    ) -> DbResult<StorageSlotHandle<'s, 'a>> {
+        self.storage(address)?.into_slot(key)
     }
 
     /// Returns account info from the overlay or the backing database.
@@ -599,15 +665,15 @@ impl<'a> State<'a> {
     /// This is the storage-side mirror of [`Self::account_info_untracked`]: a non-loading peek that
     /// returns the overlay slot value when one has been loaded or written this transaction,
     /// otherwise it reads the backing database directly without caching the result in the overlay.
-    /// A slot of a wiped account that has not been rewritten reads as zero. Use
-    /// [`Self::storage_slot`] when the slot should be loaded and preserved.
+    /// A slot of a wiped or created account that has not been rewritten reads as zero. Use
+    /// [`Self::storage`] when the slot should be loaded and preserved.
     #[inline(never)]
     pub fn storage_slot_untracked(&mut self, address: &Address, key: &Word) -> DbResult<Word> {
-        if let Some(overlay) = self.storage.get(address) {
-            if let Some(slot) = overlay.slots.get(key) {
+        if let Some(account) = self.accounts.get(address) {
+            if let Some(slot) = account.storage.slots.get(key) {
                 return Ok(slot.value.current);
             }
-            if overlay.wiped {
+            if account.storage.wiped || account.discards_storage() {
                 return Ok(Word::ZERO);
             }
         }
@@ -662,7 +728,7 @@ impl<'a> State<'a> {
         if self
             .account(address)?
             .get()
-            .is_some_and(|account| account.nonce != 0 || account.code_hash != KECCAK256_EMPTY)
+            .is_some_and(|account| account.nonce != 0 || !account.is_empty_code_hash())
         {
             return Ok(Err(InstrStop::CreateCollision));
         }
@@ -711,7 +777,7 @@ impl<'a> State<'a> {
                 if previous == *value {
                     return;
                 }
-                self.inner.journal.push(JournalEntry::TransientStorageChange {
+                self.inner.push_journal(|| JournalEntry::TransientStorageChange {
                     address: *address,
                     key: *key,
                     previous: Some(previous),
@@ -726,7 +792,7 @@ impl<'a> State<'a> {
                 if value.is_zero() {
                     return;
                 }
-                self.inner.journal.push(JournalEntry::TransientStorageChange {
+                self.inner.push_journal(|| JournalEntry::TransientStorageChange {
                     address: *address,
                     key: *key,
                     previous: None,
@@ -769,40 +835,38 @@ impl<'a> State<'a> {
                 unreachable!("journal length is checked above")
             };
             match entry {
-                JournalEntry::AccountChange {
-                    address,
-                    previous,
-                    previous_is_warm,
-                    previous_is_touched,
-                    previous_is_destroyed,
-                    previous_just_created,
-                    previous_code_changed,
-                } => {
+                JournalEntry::AccountChange { address, previous, previous_flags } => {
                     // Reconcile the self-destruct set with the restored destroyed flag.
-                    let was_destroyed =
-                        self.accounts.get(&address).is_some_and(|entry| entry.is_destroyed);
-                    if was_destroyed && !previous_is_destroyed {
+                    let was_destroyed = self
+                        .accounts
+                        .get(&address)
+                        .is_some_and(|entry| entry.flags.contains(AccountFlags::DESTROYED));
+                    let previous_destroyed = previous_flags.contains(AccountFlags::DESTROYED);
+                    if was_destroyed && !previous_destroyed {
                         self.selfdestructs.remove(&address);
-                    } else if !was_destroyed && previous_is_destroyed {
+                    } else if !was_destroyed && previous_destroyed {
                         self.selfdestructs.insert(address);
                     }
                     if let Some(entry) = self.accounts.get_mut(&address) {
                         entry.present = previous;
-                        entry.is_warm = previous_is_warm;
                         // EIP-161 preserves the historical Yellow Paper K.1 precompile-3 touch.
-                        if !(features.contains(EvmFeatures::EIP161)
-                            && address == Address::with_last_byte(3))
-                        {
-                            entry.is_touched = previous_is_touched;
+                        let keep_touch = features.contains(EvmFeatures::EIP161)
+                            && address == Address::with_last_byte(3);
+                        // Neither the finalized touch nor the storage baseline choice is journaled,
+                        // so rollback never restores them.
+                        let mut kept =
+                            AccountFlags::FINALIZED_TOUCHED | AccountFlags::KEEPS_STORAGE;
+                        if keep_touch {
+                            kept |= AccountFlags::TOUCHED;
                         }
-                        entry.is_destroyed = previous_is_destroyed;
-                        entry.just_created = previous_just_created;
-                        entry.code_changed = previous_code_changed;
+                        entry.flags = (previous_flags - kept) | (entry.flags & kept);
                     }
                 }
                 JournalEntry::StorageChange { address, key, previous } => {
-                    if let Some(storage) = self.storage.get_mut(&address)
-                        && let Some(slot) = storage.slots.get_mut(&key)
+                    if let Some(slot) = self
+                        .accounts
+                        .get_mut(&address)
+                        .and_then(|account| account.storage.slots.get_mut(&key))
                     {
                         slot.value.current = previous;
                     }
@@ -816,8 +880,10 @@ impl<'a> State<'a> {
                     }
                 },
                 JournalEntry::StorageWarmed { address, key } => {
-                    if let Some(storage) = self.storage.get_mut(&address)
-                        && let Some(slot) = storage.slots.get_mut(&key)
+                    if let Some(slot) = self
+                        .accounts
+                        .get_mut(&address)
+                        .and_then(|account| account.storage.slots.get_mut(&key))
                     {
                         slot.is_warm = false;
                     }
@@ -853,44 +919,58 @@ impl<'a> State<'a> {
     /// selfdestruct resets (EIP-8246), or pre-EIP-161 empty-account materialization.
     pub(crate) fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
         let selfdestructs = mem::take(&mut self.selfdestructs);
-        let touched: Vec<_> = self
-            .accounts
-            .iter()
-            .filter_map(|(&address, entry)| entry.is_touched.then_some(address))
-            .collect();
 
         let eip8246 = version.feature(EvmFeatures::EIP8246);
         for address in &selfdestructs {
             // EIP-8246: a self-destructed account that still holds balance is preserved as a
             // balance-only account instead of being burned. One with no balance is removed. The
             // handle is scoped so its `AccountChange` flushes on drop before the storage wipe.
-            {
+            let survives = {
                 let mut account = self.account(address)?;
-                if eip8246 && !account.balance().is_zero() {
+                let survives = eip8246 && !account.balance().is_zero();
+                if survives {
                     account.reset_selfdestructed_for_finalization();
                 } else {
                     account.delete_for_finalization();
                 }
-            }
-            self.storage(address).wipe();
+                survives
+            };
+            // Like revm, a created survivor keeps its unloaded old storage, which later
+            // transactions read as zero. One that keeps its storage baseline has no such reads,
+            // so its storage is wiped.
+            let zero_loaded_only = survives && self.accounts[address].discards_storage();
+            let mut storage = self.storage(address)?;
+            if zero_loaded_only { storage.zero_loaded() } else { storage.wipe() }
         }
 
-        if version.feature(EvmFeatures::EIP161) {
-            for address in &touched {
-                // EIP-161 deletes touched dead accounts at transaction finalization.
-                let mut account = self.account(address)?;
-                if account.is_existing_dead() {
-                    account.delete_for_finalization();
-                    drop(account);
-                    self.storage(address).wipe();
-                }
+        // Finalization never touches accounts, so clearing touches in the same pass that selects
+        // the touched accounts to finalize sees the same set. Only those accounts need another
+        // lookup, and they are rare.
+        let eip161 = version.feature(EvmFeatures::EIP161);
+        let mut finalize = Vec::new();
+        for (&address, entry) in &mut self.accounts {
+            if !entry.flags.contains(AccountFlags::TOUCHED) {
+                continue;
             }
-        } else {
-            for address in &touched {
-                // Before EIP-161, touching a non-existent account materializes it as empty.
-                if !selfdestructs.contains(address) && !self.account(address)?.exists() {
-                    self.materialize_empty_account_for_finalization(address)?;
-                }
+            entry.flags.remove(AccountFlags::TOUCHED);
+            entry.flags.insert(AccountFlags::FINALIZED_TOUCHED);
+            // EIP-161 deletes touched dead accounts at transaction finalization. Before EIP-161,
+            // touching a non-existent account materializes it as empty.
+            let needs_finalization = if eip161 {
+                entry.is_existing_dead()
+            } else {
+                entry.present.is_none() && !selfdestructs.contains(&address)
+            };
+            if needs_finalization {
+                finalize.push(address);
+            }
+        }
+        for address in &finalize {
+            if eip161 {
+                self.account(address)?.delete_for_finalization();
+                self.storage(address)?.wipe();
+            } else {
+                self.materialize_empty_account_for_finalization(address)?;
             }
         }
 
@@ -898,16 +978,11 @@ impl<'a> State<'a> {
         // detached [`PendingState`] to flag selfdestructed accounts, and `clear_transaction_state`
         // clears it at the end of the transaction lifecycle.
         self.selfdestructs = selfdestructs;
-
-        for address in touched {
-            if let Some(entry) = self.accounts.get_mut(&address) {
-                entry.is_touched = false;
-            }
-        }
         Ok(())
     }
 
-    /// Visits transaction state changes in database application order.
+    /// Visits transaction state changes in database application order: each account's bytecode
+    /// and storage precede its metadata.
     ///
     /// This borrows changes directly from the transaction layer without detaching it and does not
     /// mutate the accepted overlay.
@@ -915,47 +990,20 @@ impl<'a> State<'a> {
         &self,
         sink: &mut S,
     ) -> Result<(), S::Error> {
-        for entry in self.accounts.values() {
-            if let Some((code_hash, code)) = entry.changed_code() {
-                sink.bytecode(code_hash, code)?;
-            }
+        for changes in self.transaction_account_changes() {
+            changes.visit(sink)?;
         }
-
-        for (&address, storage) in &self.storage {
-            if storage.wiped {
-                sink.storage_wipe(address)?;
-            }
-            for (&key, slot) in &storage.slots {
-                let value = &slot.value;
-                if slot.is_changed(storage.wiped) {
-                    sink.storage(StorageChange {
-                        address,
-                        key,
-                        original: value.original,
-                        current: value.current,
-                    })?;
-                } else {
-                    sink.storage_read(address, key, value.current)?;
-                }
-            }
-        }
-
-        for (&address, entry) in self.accounts.iter() {
-            let selfdestructed = self.selfdestructs.contains(&address);
-            if entry.is_changed() || entry.is_created() || selfdestructed {
-                sink.account(AccountChangeRef {
-                    address,
-                    original: entry.original.as_ref(),
-                    current: entry.present.as_ref(),
-                    created: entry.is_created(),
-                    selfdestructed,
-                })?;
-            } else {
-                sink.account_read(address, entry.present.as_ref())?;
-            }
-        }
-
         Ok(())
+    }
+
+    /// Returns each account loaded by the transaction with its changes, in an unspecified order.
+    ///
+    /// This borrows the transaction layer without detaching it.
+    #[inline]
+    pub(crate) fn transaction_account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
+        self.accounts.iter().map(|(&address, account)| {
+            account.changes(address, self.selfdestructs.contains(&address))
+        })
     }
 
     /// Detaches the transaction overlay into an owned [`PendingState`].
@@ -965,7 +1013,6 @@ impl<'a> State<'a> {
     pub(crate) fn take_pending_state(&mut self) -> PendingState {
         PendingState {
             accounts: mem::take(&mut self.accounts),
-            storage: mem::take(&mut self.storage),
             selfdestructs: mem::take(&mut self.inner.selfdestructs),
         }
     }
@@ -975,20 +1022,18 @@ impl<'a> State<'a> {
     /// Account and slot originals become their current values, runtime slot warmth is cleared, and
     /// account warmth is retained only for pre-warmed addresses. Other account metadata is
     /// preserved.
-    pub fn prepare_isolated_state(&self) -> PendingState {
+    #[cfg(test)]
+    pub(crate) fn prepare_isolated_state(&self) -> PendingState {
         let mut accounts = self.accounts.clone();
         for (address, account) in &mut accounts {
             account.original = account.present.clone();
-            account.is_warm = self.inner.prewarm_set.is_warm(address);
-        }
-        let mut storage = self.storage.clone();
-        for overlay in storage.values_mut() {
-            for slot in overlay.slots.values_mut() {
+            account.flags.set(AccountFlags::WARM, self.inner.prewarm_set.is_warm(address));
+            for slot in account.storage.slots.values_mut() {
                 slot.value = Tracked::new(slot.value.current);
                 slot.is_warm = false;
             }
         }
-        PendingState { accounts, storage, selfdestructs: self.inner.selfdestructs.clone() }
+        PendingState { accounts, selfdestructs: self.inner.selfdestructs.clone() }
     }
 
     /// Merges an isolated transaction's returned state without adding journal entries.
@@ -997,7 +1042,8 @@ impl<'a> State<'a> {
     /// warmth is combined, current values are replaced, and account lifecycle flags are combined.
     /// Newly loaded accounts and slots retain their child metadata. Journals, logs, pre-warmed
     /// sets, transient storage and backing databases are unchanged.
-    pub fn merge_isolated_state(&mut self, child: PendingState) {
+    #[cfg(test)]
+    pub(crate) fn merge_isolated_state(&mut self, child: PendingState) {
         for (address, account) in child.accounts {
             match self.accounts.entry(address) {
                 hash_map::Entry::Vacant(entry) => {
@@ -1005,33 +1051,15 @@ impl<'a> State<'a> {
                 }
                 hash_map::Entry::Occupied(mut entry) => {
                     let parent = entry.get_mut();
-                    parent.present = account.present;
-                    parent.is_touched |= account.is_touched;
-                    parent.is_destroyed |= account.is_destroyed;
-                    parent.just_created |= account.just_created;
-                    parent.code_changed |= account.code_changed;
-                }
-            }
-        }
-        for (address, storage) in child.storage {
-            let parent = self.storage.entry(address).or_default();
-            parent.wiped |= storage.wiped;
-            for (key, slot) in storage.slots {
-                match parent.slots.entry(key) {
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert(slot);
-                    }
-                    hash_map::Entry::Occupied(mut entry) => {
-                        let parent = entry.get_mut();
-                        parent.value.current = slot.value.current;
-                        parent.is_warm |= slot.is_warm;
-                    }
+                    parent.merge_isolated(account);
                 }
             }
         }
         for address in child.selfdestructs {
-            let still_pending =
-                self.accounts.get(&address).is_some_and(|account| account.is_destroyed);
+            let still_pending = self
+                .accounts
+                .get(&address)
+                .is_some_and(|account| account.flags.contains(AccountFlags::DESTROYED));
             if still_pending {
                 self.inner.selfdestructs.insert(address);
             }
@@ -1046,10 +1074,11 @@ impl<'a> State<'a> {
     /// finalized. Other transaction scratch (journal, logs, warm sets, transient storage) is not
     /// affected.
     pub fn set_pending_state(&mut self, pending: PendingState) {
-        let PendingState { accounts, storage, selfdestructs } = pending;
-        self.accounts = accounts;
-        self.storage = storage;
-        self.inner.selfdestructs = selfdestructs;
+        for account in self.accounts.values_mut() {
+            self.storage_pool.clear_overlay(&mut account.storage);
+        }
+        self.accounts = pending.accounts;
+        self.inner.selfdestructs = pending.selfdestructs;
     }
 
     /// Accepts the current transaction's state transition into the accepted overlay.
@@ -1060,9 +1089,11 @@ impl<'a> State<'a> {
     pub fn commit_transaction(&mut self) {
         // The transaction overlay is folded into the accepted-overlay database directly, without
         // detaching it.
-        self.inner.database.commit(&self.accounts, &self.storage);
+        self.inner.database.commit(&self.accounts);
+        for account in self.accounts.values_mut() {
+            self.storage_pool.clear_overlay(&mut account.storage);
+        }
         self.accounts.clear();
-        self.storage_pool.clear(&mut self.storage);
         self.inner.selfdestructs.clear();
     }
 }
@@ -1070,6 +1101,274 @@ impl<'a> State<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn committed_copy_matches_committed_clone() {
+        let (written, read, absent) =
+            (Address::with_last_byte(1), Address::with_last_byte(2), Address::with_last_byte(3));
+        let mut db = CacheDB::default();
+        db.insert_account_info(&read, AccountInfo::default().with_nonce(3));
+        let mut state = State::new(db);
+        state.account(&written).unwrap().set_balance(Word::from(5));
+        state.storage_slot(&written, Word::ONE).unwrap().set(Word::from(6));
+        state.commit_transaction();
+        // The running transaction overwrites accepted values, reads others, and leaves scratch.
+        state.storage_slot(&written, Word::ONE).unwrap().set(Word::from(7));
+        state.storage_slot(&written, Word::from(2)).unwrap().set(Word::from(8));
+        state.account(&read).unwrap();
+        state.prewarm(&absent);
+        state.tstore(&written, &Word::ZERO, &Word::from(9));
+        state.log(Log::default());
+
+        let mut expected = state.clone_with(EmptyDB::default());
+        expected.commit_transaction();
+        expected.clear_transaction_state();
+        let mut copy = state.committed_copy(EmptyDB::default());
+
+        assert!(copy.journal().is_empty() && copy.logs().is_empty());
+        assert_eq!(copy.checkpoint(), expected.checkpoint());
+        for state in [&mut expected, &mut copy] {
+            assert_eq!(
+                state.account_info_untracked(&written).unwrap().unwrap().balance,
+                Word::from(5)
+            );
+            assert_eq!(state.account_info_untracked(&read).unwrap().unwrap().nonce, 3);
+            assert_eq!(state.storage_slot_untracked(&written, &Word::ONE).unwrap(), Word::from(7));
+            assert_eq!(
+                state.storage_slot_untracked(&written, &Word::from(2)).unwrap(),
+                Word::from(8)
+            );
+            assert_eq!(state.tload(&written, &Word::ZERO), Word::ZERO);
+            assert!(!state.account(&absent).unwrap().is_warm());
+            let slot = state.storage_slot(&written, Word::ONE).unwrap();
+            assert_eq!((slot.original(), slot.current()), (Word::from(7), Word::from(7)));
+        }
+    }
+
+    #[test]
+    fn storage_loads_account_without_touching_or_warming_it() {
+        let address = Address::with_last_byte(42);
+        let info = AccountInfo::default().with_nonce(7);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, info.clone());
+        let mut state = State::new(db);
+
+        state.storage(&address).unwrap();
+
+        let account = &state.accounts[&address];
+        assert_eq!(account.original, Some(info.clone()));
+        assert_eq!(account.present, Some(info));
+        assert!(account.flags.is_empty());
+        assert!(state.journal().is_empty());
+    }
+
+    #[test]
+    fn created_account_reads_old_storage_as_zero() {
+        let caller = Address::with_last_byte(1);
+        let address = Address::with_last_byte(2);
+        let (loaded, unloaded) = (Word::from(1), Word::from(2));
+        let features = EvmFeatures::empty();
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        db.insert_account_storage(&address, &loaded, &Word::from(5));
+        db.insert_account_storage(&address, &unloaded, &Word::from(6));
+        let mut state = State::new(db);
+        assert_eq!(state.storage_slot(&address, loaded).unwrap().current(), Word::from(5));
+
+        let checkpoint = state.checkpoint();
+        state.create_account(&caller, &address, &Word::ZERO, features).unwrap().unwrap();
+        // A slot loaded before the creation keeps its value, as in revm.
+        assert_eq!(state.storage_slot(&address, loaded).unwrap().current(), Word::from(5));
+        assert_eq!(state.storage_slot(&address, unloaded).unwrap().current(), Word::ZERO);
+        assert_eq!(state.storage_slot(&address, unloaded).unwrap().original(), Word::ZERO);
+        assert_eq!(state.storage_slot_untracked(&address, &unloaded).unwrap(), Word::ZERO);
+        assert_eq!(state.get_storage(&address, &unloaded), Some(Word::ZERO));
+        state.storage_slot(&address, unloaded).unwrap().write(Word::from(9));
+
+        state.rollback(checkpoint, features);
+        // Like revm, rolling back the creation keeps the zero it loaded, so a retried creation
+        // still reads zero.
+        assert_eq!(state.storage_slot(&address, loaded).unwrap().current(), Word::from(5));
+        assert_eq!(state.storage_slot(&address, unloaded).unwrap().current(), Word::ZERO);
+        let checkpoint = state.checkpoint();
+        state.create_account(&caller, &address, &Word::ZERO, features).unwrap().unwrap();
+        assert_eq!(state.storage_slot(&address, unloaded).unwrap().current(), Word::ZERO);
+        state.rollback(checkpoint, features);
+        assert!(!state.take_pending_state().is_changed());
+    }
+
+    #[test]
+    fn created_account_keeping_storage_reads_and_commits_its_baseline() {
+        let caller = Address::with_last_byte(1);
+        let address = Address::with_last_byte(2);
+        let (written, unwritten) = (Word::from(1), Word::from(2));
+        let features = EvmFeatures::empty();
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_nonce(1));
+        db.insert_account_storage(&address, &written, &Word::from(5));
+        db.insert_account_storage(&address, &unwritten, &Word::from(6));
+        let mut state = State::new(db);
+
+        let mut account = state.account(&address).unwrap();
+        account.mark_created_keeping_storage();
+        // Still created for EIP-6780 `SELFDESTRUCT`.
+        assert!(account.is_created());
+        drop(account);
+        assert_eq!(state.storage_slot_untracked(&address, &unwritten).unwrap(), Word::from(6));
+        let mut slot = state.storage_slot(&address, written).unwrap();
+        assert_eq!((slot.original(), slot.current()), (Word::from(5), Word::from(5)));
+        slot.write(Word::from(9));
+
+        // Committing keeps the slots the transaction did not write.
+        state.commit_transaction();
+        assert_eq!(state.storage_slot(&address, written).unwrap().current(), Word::from(9));
+        assert_eq!(state.storage_slot(&address, unwritten).unwrap().current(), Word::from(6));
+
+        // Rolling back the mark forgets the kept baseline, and an account already created in the
+        // overlay keeps reading its old storage as zero.
+        let other = Address::with_last_byte(3);
+        state
+            .overlay_db_mut()
+            .insert_account_info(&other, AccountInfo::default().with_balance(Word::from(1)));
+        state.overlay_db_mut().insert_account_storage(&other, &unwritten, &Word::from(6));
+        let checkpoint = state.checkpoint();
+        state.account(&other).unwrap().mark_created_keeping_storage();
+        state.rollback(checkpoint, features);
+        state.create_account(&caller, &other, &Word::ZERO, features).unwrap().unwrap();
+        assert_eq!(state.storage_slot_untracked(&other, &unwritten).unwrap(), Word::ZERO);
+        state.account(&other).unwrap().mark_created_keeping_storage();
+        assert_eq!(state.storage_slot(&other, unwritten).unwrap().current(), Word::ZERO);
+    }
+
+    #[test]
+    fn finalization_keeps_storage_of_prefunded_created_account() {
+        let caller = Address::with_last_byte(1);
+        let address = Address::with_last_byte(2);
+        let written = Word::from(2);
+        let version = Version::base(crate::SpecId::CANCUN);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        let mut state = State::new(db);
+
+        state.create_account(&caller, &address, &Word::ZERO, version.features).unwrap().unwrap();
+        state.storage_slot(&address, written).unwrap().write(Word::from(9));
+        state.finalize_transaction_(version);
+
+        let pending = state.take_pending_state();
+        let storage = &pending.accounts[&address].storage;
+        assert!(!storage.wiped);
+        assert_eq!(storage.changed_slots().map(|(key, _)| *key).collect::<Vec<_>>(), [written]);
+    }
+
+    #[test]
+    fn eip8246_created_survivor_keeps_old_storage() {
+        let caller = Address::with_last_byte(1);
+        let address = Address::with_last_byte(2);
+        let (written, old) = (Word::from(1), Word::from(2));
+        let version = Version::base(crate::SpecId::AMSTERDAM);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        db.insert_account_storage(&address, &old, &Word::from(6));
+        let mut state = State::new(db);
+
+        state.create_account(&caller, &address, &Word::ZERO, version.features).unwrap().unwrap();
+        state.storage_slot(&address, written).unwrap().write(Word::from(9));
+        state.account(&address).unwrap().mark_destructed();
+        state.finalize_transaction_(version);
+
+        let storage = &state.accounts[&address].storage;
+        assert!(!storage.wiped);
+        assert_eq!(storage.changed_slots().count(), 0);
+        state.commit_transaction();
+        for key in [written, old] {
+            assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::ZERO);
+        }
+    }
+
+    #[test]
+    fn eip8246_survivor_keeping_storage_wipes_it() {
+        let address = Address::with_last_byte(2);
+        let (written, earlier) = (Word::from(1), Word::from(2));
+        let version = Version::base(crate::SpecId::AMSTERDAM);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        // A slot the account's creation wrote before the transaction was suspended.
+        db.insert_account_storage(&address, &earlier, &Word::from(6));
+        let mut state = State::new(db);
+
+        state.account(&address).unwrap().mark_created_keeping_storage();
+        state.storage_slot(&address, written).unwrap().write(Word::from(9));
+        state.account(&address).unwrap().mark_destructed();
+        state.finalize_transaction_(version);
+
+        assert!(state.accounts[&address].storage.wiped);
+        state.commit_transaction();
+        for key in [written, earlier] {
+            assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::ZERO);
+        }
+    }
+
+    #[test]
+    fn rollback_of_later_creation_mark_keeps_storage_baseline() {
+        let address = Address::with_last_byte(2);
+        let key = Word::from(1);
+        let features = Version::base(crate::SpecId::CANCUN).features;
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        db.insert_account_storage(&address, &key, &Word::from(6));
+        let mut state = State::new(db);
+
+        state.account(&address).unwrap().mark_created_keeping_storage();
+        let checkpoint = state.checkpoint();
+        state.account(&address).unwrap().mark_created();
+        state.rollback(checkpoint, features);
+
+        assert!(!state.accounts[&address].discards_storage());
+        assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::from(6));
+    }
+
+    #[test]
+    fn later_transactions_read_old_storage_of_created_account_as_zero() {
+        let caller = Address::with_last_byte(1);
+        let address = Address::with_last_byte(2);
+        let (cached, unloaded, written) = (Word::from(1), Word::from(2), Word::from(3));
+        let version = Version::base(crate::SpecId::CANCUN);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        db.insert_account_storage(&address, &cached, &Word::from(5));
+        db.insert_account_storage(&address, &unloaded, &Word::from(6));
+        let mut state = State::new(db);
+        assert_eq!(state.storage_slot(&address, cached).unwrap().current(), Word::from(5));
+        state.commit_transaction();
+
+        state.create_account(&caller, &address, &Word::ZERO, version.features).unwrap().unwrap();
+        state.storage_slot(&address, written).unwrap().write(Word::from(9));
+        state.finalize_transaction_(version);
+        state.commit_transaction();
+
+        for (key, value) in [(cached, Word::ZERO), (unloaded, Word::ZERO), (written, Word::from(9))]
+        {
+            assert_eq!(state.storage_slot(&address, key).unwrap().current(), value);
+        }
+    }
+
+    #[test]
+    fn account_storage_handle_reuses_pooled_slot_map() {
+        let address = Address::with_last_byte(1);
+        let mut state = State::new(EmptyDB::default());
+        let key = Word::from(1);
+        state.storage_slot(&address, key).unwrap();
+        let expected_capacity = state.accounts[&address].storage.slots.capacity();
+        assert!(expected_capacity > 0);
+        state.commit_transaction();
+
+        let mut account = state.account(&address).unwrap();
+        account.storage();
+        drop(account);
+
+        assert_eq!(state.accounts[&address].storage.slots.capacity(), expected_capacity);
+    }
 
     #[test]
     fn clone_preserves_state_and_detaches_database() {
@@ -1111,13 +1410,28 @@ mod tests {
     }
 
     #[test]
+    fn detached_snapshot_is_send_sync_and_uses_new_database() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StateSnapshot>();
+
+        let uncached = Address::with_last_byte(43);
+        let state = State::new(EmptyDB::default());
+        let snapshot = state.snapshot();
+
+        let mut db = CacheDB::default();
+        db.insert_account_info(&uncached, AccountInfo::default().with_balance(Word::from(9)));
+        let mut restored = snapshot.into_state(db);
+        assert_eq!(restored.account(&uncached).unwrap().balance(), Word::from(9));
+    }
+
+    #[test]
     fn set_storage_warm_preserves_loaded_values() {
         let address = Address::with_last_byte(42);
         let key = Word::from(1);
         for prewarmed in [false, true] {
             let mut state = State::new(EmptyDB::default());
             state.set_storage_warm(&address, key, true);
-            assert!(!state.storage(&address).is_loaded(&key));
+            assert!(!state.storage(&address).unwrap().is_loaded(&key));
             if prewarmed {
                 state.prewarm_storage(&address, [key, Word::from(2)]);
             }
@@ -1126,8 +1440,8 @@ mod tests {
             slot.warm();
             let checkpoint = state.checkpoint();
             state.set_storage_warm(&address, key, false);
-            assert_eq!(state.storage(&address).is_warm(&key), prewarmed);
-            assert_eq!(state.storage(&address).is_warm(&Word::from(2)), prewarmed);
+            assert_eq!(state.storage(&address).unwrap().is_warm(&key), prewarmed);
+            assert_eq!(state.storage(&address).unwrap().is_warm(&Word::from(2)), prewarmed);
             state.rollback(checkpoint, crate::EvmFeatures::empty());
             let mut slot = state.storage_slot(&address, key).unwrap();
             assert_eq!((slot.original(), slot.current()), (Word::ZERO, Word::from(7)));
@@ -1135,6 +1449,37 @@ mod tests {
             state.set_storage_warm(&address, key, false);
             state.set_storage_warm(&address, key, true);
             assert!(!state.storage_slot(&address, key).unwrap().warm());
+        }
+    }
+
+    #[test]
+    fn set_account_warm_preserves_loaded_values() {
+        let address = Address::with_last_byte(42);
+        let key = Word::from(1);
+        for prewarmed in [false, true] {
+            let mut state = State::new(EmptyDB::default());
+            state.set_account_warm(&address, true);
+            assert!(!state.accounts.contains_key(&address));
+            if prewarmed {
+                state.prewarm(&address);
+            }
+            let mut account = state.account(&address).unwrap();
+            account.set_balance(Word::from(7));
+            account.warm();
+            drop(account);
+            state.storage_slot(&address, key).unwrap().warm();
+            let checkpoint = state.checkpoint();
+            state.set_account_warm(&address, false);
+            assert_eq!(state.account(&address).unwrap().is_warm(), prewarmed);
+            assert!(state.storage(&address).unwrap().is_warm(&key));
+            state.rollback(checkpoint, crate::EvmFeatures::empty());
+            let mut account = state.account(&address).unwrap();
+            assert_eq!(account.balance(), Word::from(7));
+            assert_eq!(account.warm(), !prewarmed);
+            drop(account);
+            state.set_account_warm(&address, false);
+            state.set_account_warm(&address, true);
+            assert!(!state.account(&address).unwrap().warm());
         }
     }
 
@@ -1150,13 +1495,13 @@ mod tests {
             state.tstore(&Address::ZERO, &Word::ZERO, &Word::from(7));
             let kept_log: Log = Log { address: Address::with_last_byte(1), ..Default::default() };
             state.log(kept_log.clone());
-            let snapshot = state.clone();
+            let snapshot = state.snapshot();
             for slot in 1..=2 {
                 state.tstore(&Address::ZERO, &Word::from(slot), &Word::from(8));
             }
             state.log(Log::default());
             let child = state.checkpoint();
-            state = snapshot;
+            state = snapshot.into_state(EmptyDB::default());
             for n in 0..writes {
                 state.tstore(&Address::ZERO, &Word::ZERO, &Word::from(10 + n));
             }
@@ -1197,7 +1542,7 @@ mod tests {
             created_account.mark_created();
         }
         parent.account(&destroyed).unwrap().mark_destructed();
-        parent.storage(&wiped).wipe();
+        parent.storage(&wiped).unwrap().wipe();
         let mut slot = parent.storage_slot(&address, Word::ZERO).unwrap();
         slot.set(Word::from(7));
         slot.warm();
@@ -1209,7 +1554,7 @@ mod tests {
         assert!(child.account(&prewarmed).unwrap().is_warm());
         assert!(child.account(&created).unwrap().is_created());
         assert!(child.account(&destroyed).unwrap().is_destructed());
-        assert!(child.storage(&wiped).is_wiped());
+        assert!(child.storage(&wiped).unwrap().is_wiped());
         assert_eq!(child.tload(&address, &Word::ZERO), Word::ZERO);
         let mut slot = child.storage_slot(&address, Word::ZERO).unwrap();
         assert_eq!((slot.original(), slot.current()), (Word::from(7), Word::from(7)));
@@ -1227,7 +1572,7 @@ mod tests {
         assert_eq!(parent.tload(&address, &Word::ZERO), Word::from(9));
         assert!(parent.accounts[&created].is_created());
         assert!(parent.inner.selfdestructs.contains(&destroyed));
-        assert!(parent.storage[&wiped].wiped);
+        assert!(parent.accounts[&wiped].storage.wiped);
         assert_eq!(parent.accounts[&child_only].present.as_ref().unwrap().balance, Word::ONE);
         assert_eq!(parent.get_storage(&child_only, &Word::ZERO), Some(Word::ONE));
     }
@@ -1268,7 +1613,7 @@ mod tests {
         let mut parent = State::new(db);
         parent.account(&address).unwrap();
         parent.storage_slot(&address, key).unwrap();
-        parent.storage(&address).wipe();
+        parent.storage(&address).unwrap().wipe();
 
         let mut child = State::new(EmptyDB::default());
         child.set_pending_state(parent.prepare_isolated_state());
@@ -1291,7 +1636,7 @@ mod tests {
             account.mark_destructed();
         }
         child.finalize_transaction_(Version::base(crate::SpecId::AMSTERDAM));
-        assert!(!child.accounts[&address].is_destroyed);
+        assert!(!child.accounts[&address].flags.contains(AccountFlags::DESTROYED));
         assert!(child.inner.selfdestructs.contains(&address));
 
         let mut parent = State::new(EmptyDB::default());
@@ -1306,106 +1651,77 @@ mod tests {
     }
 
     #[test]
-    fn merge_transaction_account_retains_target_only_slots_and_source_metadata() {
-        let address = Address::with_last_byte(42);
-        let mut source_db = CacheDB::default();
-        source_db.insert_account_storage(&address, &Word::ZERO, &Word::from(5));
-        let mut target_db = CacheDB::default();
-        target_db.insert_account_storage(&address, &Word::ZERO, &Word::from(6));
-        let mut source = State::new(source_db);
-        let mut target = State::new(target_db);
-        source.account(&address).unwrap().set_balance(Word::from(17));
-        source.account(&address).unwrap().mark_destructed();
-        source.account(&address).unwrap().mark_created();
-        source.storage_slot(&address, Word::ZERO).unwrap().set(Word::from(11));
-        source.storage_slot(&address, Word::ZERO).unwrap().warm();
-        target.account(&address).unwrap().set_balance(Word::from(9));
-        target.storage_slot(&address, Word::ZERO).unwrap().set(Word::from(99));
-        target.storage_slot(&address, Word::ONE).unwrap().set(Word::from(22));
-        target.tstore(&address, &Word::ZERO, &Word::from(33));
-        let checkpoint = target.checkpoint();
-        target.merge_transaction_account_from(&address, &source);
-        assert_eq!(target.accounts[&address], source.accounts[&address]);
-        assert_eq!(
-            target.storage[&address].slots[&Word::ZERO],
-            source.storage[&address].slots[&Word::ZERO]
-        );
-        assert_eq!(target.get_storage(&address, &Word::ONE), Some(Word::from(22)));
-        assert!(target.inner.selfdestructs.contains(&address));
-        assert_eq!(target.tload(&address, &Word::ZERO), Word::from(33));
-        assert_eq!(target.checkpoint(), checkpoint);
-        target.storage_slot(&address, Word::ZERO).unwrap().set(Word::from(44));
-        target.rollback(checkpoint, crate::EvmFeatures::empty());
-        assert_eq!(target.get_storage(&address, &Word::ZERO), Some(Word::from(11)));
-        target.merge_transaction_account_from(&address, &State::new(EmptyDB::default()));
-        assert_eq!(target.get_storage(&address, &Word::ONE), Some(Word::from(22)));
-        assert!(target.inner.selfdestructs.contains(&address));
-        let mut live = State::new(EmptyDB::default());
-        live.account(&address).unwrap().set_balance(Word::ONE);
-        target.merge_transaction_account_from(&address, &live);
-        assert!(!target.inner.selfdestructs.contains(&address));
-    }
-
-    #[test]
-    fn merge_transaction_account_reinserts_retained_slots_after_wipe() {
-        let address = Address::with_last_byte(42);
+    fn replaced_prewarm_set_keeps_runtime_warmth_and_journal() {
+        let old_base = Address::with_last_byte(41);
+        let new_base = Address::with_last_byte(42);
         let key = Word::ONE;
-        let mut target_db = CacheDB::default();
-        target_db.insert_account_storage(&address, &key, &Word::from(22));
-        let mut source = State::new(EmptyDB::default());
-        let mut target = State::new(target_db);
-        source.account(&address).unwrap();
-        source.storage(&address).wipe();
-        target.storage_slot(&address, key).unwrap();
+        let mut state = State::new(EmptyDB::default());
+        state.prewarm_storage_slot(&old_base, key);
+        state.account(&new_base).unwrap().set_balance(Word::from(7));
+        let journal = state.journal().to_vec();
+        let mut prewarm_set = PrewarmSet::new();
+        prewarm_set.warm_storage(&new_base, [key]);
+        *state.prewarm_set_mut() = prewarm_set.clone();
 
-        target.merge_transaction_account_from(&address, &source);
-        assert_eq!(target.get_storage(&address, &key), Some(Word::from(22)));
-        target.commit_transaction();
+        assert_eq!(state.prewarm_set(), &prewarm_set);
+        assert_eq!(state.journal(), journal);
+        assert!(!state.account(&old_base).unwrap().is_warm());
+        assert!(!state.storage_slot(&old_base, key).unwrap().is_warm());
+        assert!(state.account(&new_base).unwrap().is_warm());
+        assert!(state.storage_slot(&new_base, key).unwrap().is_warm());
 
-        assert_eq!(target.storage_slot_untracked(&address, &key).unwrap(), Word::from(22));
+        let cooled = Address::with_last_byte(43);
+        state.prewarm(&cooled);
+        state.prewarm_set_mut().remove(&cooled);
+        assert!(!state.account(&cooled).unwrap().is_warm());
+    }
+
+    fn sorted_loaded_accounts(state: &State<'_>) -> Vec<(Address, Vec<Word>)> {
+        let mut loaded = state
+            .loaded_accounts()
+            .map(|(address, slots)| {
+                let mut slots = slots.copied().collect::<Vec<_>>();
+                slots.sort_unstable();
+                (*address, slots)
+            })
+            .collect::<Vec<_>>();
+        loaded.sort_unstable();
+        loaded
     }
 
     #[test]
-    fn clears_account_touch_and_storage_warmth() {
-        let address = Address::with_last_byte(42);
-        let storage_only = Address::with_last_byte(43);
-        let mut state = State::new(EmptyDB::default());
+    fn loaded_accounts_include_reads_and_absent_accounts() {
+        let read = Address::from([0x74; 20]);
+        let absent = Address::from([0x75; 20]);
+        let accepted = Address::from([0x76; 20]);
+        let mut database = CacheDB::default();
+        database.insert_account_info(&read, AccountInfo::default().with_balance(Word::from(1)));
+        database.insert_account_storage(&read, &Word::from(1), &Word::from(10));
+        let mut state = State::new(database);
+        state.account(&accepted).unwrap().set_balance(Word::from(1));
+        state.commit_transaction();
 
-        {
-            let mut slot = state.storage_slot(&storage_only, Word::ZERO).unwrap();
-            slot.set(Word::ONE);
-            slot.warm();
-        }
-        state.clear_account_touch_and_storage_warmth(&storage_only);
-        assert!(state.accounts.is_empty());
-        {
-            let mut slot = state.storage_slot(&storage_only, Word::ZERO).unwrap();
-            assert_eq!(slot.current(), Word::ONE);
-            assert!(slot.warm(), "first access after cooling must be cold");
-            assert!(!slot.warm(), "the following access must be warm");
-        }
+        state.storage_slot(&read, Word::from(1)).unwrap();
+        state.storage_slot(&read, Word::from(2)).unwrap();
+        state.account(&absent).unwrap();
 
-        {
-            let mut account = state.account(&address).unwrap();
-            account.set_balance(Word::from(10));
-            account.touch();
-            account.warm();
-        }
-        for key in [Word::ZERO, Word::ONE] {
-            let mut slot = state.storage_slot(&address, key).unwrap();
-            slot.set(Word::from(7));
-            slot.warm();
-        }
-        state.prewarm_storage_slot(&address, Word::ONE);
+        assert_eq!(
+            sorted_loaded_accounts(&state),
+            [(read, vec![Word::from(1), Word::from(2)]), (absent, vec![])]
+        );
+    }
+
+    #[test]
+    fn loaded_accounts_include_reads_in_reverted_frames() {
+        let read = Address::with_last_byte(0x77);
+        let mut database = CacheDB::default();
+        database.insert_account_info(&read, AccountInfo::default().with_balance(Word::from(1)));
+        let mut state = State::new(database);
+
         let checkpoint = state.checkpoint();
-        state.clear_account_touch_and_storage_warmth(&address);
-        assert_eq!(state.checkpoint(), checkpoint);
-        assert!(!state.accounts[&address].is_touched);
-        assert!(state.accounts[&address].is_warm);
-        for key in [Word::ZERO, Word::ONE] {
-            let slot = state.storage_slot(&address, key).unwrap();
-            assert_eq!(slot.is_warm(), key == Word::ONE);
-            assert_eq!((slot.original(), slot.current()), (Word::ZERO, Word::from(7)));
-        }
+        state.storage_slot(&read, Word::ONE).unwrap();
+        state.rollback(checkpoint, EvmFeatures::empty());
+
+        assert_eq!(sorted_loaded_accounts(&state), [(read, vec![Word::ONE])]);
     }
 }

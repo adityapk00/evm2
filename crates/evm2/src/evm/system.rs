@@ -151,8 +151,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         // `SYSTEM_MAX_SSTORES_PER_CALL` new-slot writes (execution-specs
         // `process_unchecked_system_transaction`).
         let reservoir = if self.feature(EvmFeatures::EIP8037) {
-            self.version().gas_params.get(GasId::SstoreSetState) as u64
-                * SYSTEM_MAX_SSTORES_PER_CALL
+            self.version().gas_params.get(GasId::SstoreSetState) * SYSTEM_MAX_SSTORES_PER_CALL
         } else {
             0
         };
@@ -284,7 +283,8 @@ mod tests {
         };
         assert!(unchanged(&SYSTEM_ADDRESS));
         assert!(unchanged(&beneficiary));
-        let storage = &result.pending_state.storage.get(&contract).expect("storage changed").slots;
+        let storage =
+            &result.pending_state.accounts.get(&contract).expect("storage changed").storage.slots;
         let system_address = U256::from_be_slice(SYSTEM_ADDRESS.as_slice());
         assert_eq!(storage.get(&U256::ZERO).map(|slot| slot.value.current), Some(system_address));
         assert_eq!(storage.get(&U256::ONE).map(|slot| slot.value.current), Some(system_address));
@@ -321,7 +321,8 @@ mod tests {
             .detach();
 
         assert!(result.result.status);
-        let storage = &result.pending_state.storage.get(&contract).expect("storage changed").slots;
+        let storage =
+            &result.pending_state.accounts.get(&contract).expect("storage changed").storage.slots;
         let caller = U256::from_be_slice(caller.as_slice());
         assert_eq!(storage.get(&U256::ZERO).map(|slot| slot.value.current), Some(caller));
         assert_eq!(storage.get(&U256::ONE).map(|slot| slot.value.current), Some(caller));

@@ -32,29 +32,67 @@ const REPLAY_WARM_UP: Duration = Duration::from_secs(3);
 const REPLAY_MEASUREMENT_SECS: u64 = 15;
 const REPLAY_SAMPLE_SIZE: usize = 20;
 
+/// Mainnet contract fixtures, which the `jit-mainnet` CodSpeed shard runs apart from the rest.
+const MAINNET_CONTRACTS: &[&str] = &[
+    "usdt",
+    "universal_router",
+    "aggregation_router_v6",
+    "entry_point_v0_7",
+    "uniswap_v3_pool",
+    "uniswap_v4_pool_manager",
+    "curve_3pool",
+    "curve_tricrypto2",
+    "balancer_vault",
+    "succinct_staking",
+];
+
 fn evm(c: &mut Criterion) {
     let mut group = c.benchmark_group("evm");
     apply_default_budget(&mut group);
 
-    let benches = evm_bench::BENCHES;
+    let shard = env::var("EVM2_BENCH_SHARD").ok();
+    assert!(
+        matches!(shard.as_deref(), None | Some("interpreter" | "jit" | "jit-mainnet")),
+        "unknown EVM2_BENCH_SHARD: {shard:?}"
+    );
+    let bench_interpreter = matches!(shard.as_deref(), None | Some("interpreter"));
+    assert!(
+        bench_interpreter || cfg!(feature = "jit"),
+        "JIT benchmark shards require the jit feature"
+    );
+
+    // The mainnet contracts take roughly half the JIT time. Filter before fixture loading and JIT
+    // setup.
+    let benches = evm_bench::BENCHES
+        .iter()
+        .copied()
+        .filter(|bench| match shard.as_deref() {
+            Some("jit") => !MAINNET_CONTRACTS.contains(&bench.name),
+            Some("jit-mainnet") => MAINNET_CONTRACTS.contains(&bench.name),
+            _ => true,
+        })
+        .collect::<Vec<_>>();
     let suites =
         fixture::Suites::load(benches.iter().filter_map(|bench| bench.transaction_fixture_path()));
-    let cases = expand_cases(benches, &suites);
+    let cases = expand_cases(&benches, &suites);
 
-    let bench_revm = env::var_os("EVM2_BENCH_REVM").is_some();
+    let bench_revm = bench_interpreter && env::var_os("EVM2_BENCH_REVM").is_some();
 
     #[cfg(feature = "jit")]
-    let mut jit_compiler = jit::Compiler::new();
+    let mut jit_compiler = (shard.as_deref() != Some("interpreter")).then(jit::Compiler::new);
 
     for bench in &cases {
         match bench.kind {
             BenchCaseKind::Transaction { .. } => {
-                let prepared = support::PreparedBench::load(bench, &suites);
-                prepared.sanity_check();
-                prepared.bench(&mut group);
+                if bench_interpreter {
+                    let prepared = support::PreparedBench::load(bench, &suites);
+                    prepared.sanity_check();
+                    prepared.bench(&mut group);
+                }
 
                 #[cfg(feature = "jit")]
-                if let Some(prepared) = jit::PreparedBench::load(bench, &suites, &mut jit_compiler)
+                if let Some(compiler) = &mut jit_compiler
+                    && let Some(prepared) = jit::PreparedBench::load(bench, &suites, compiler)
                 {
                     prepared.sanity_check();
                     prepared.bench(&mut group);
@@ -66,6 +104,7 @@ fn evm(c: &mut Criterion) {
                     prepared.bench(&mut group);
                 }
             }
+            BenchCaseKind::BlockchainReplay if !bench_interpreter => {}
             BenchCaseKind::BlockchainReplay => {
                 let prepared = mainnet::PreparedBench::load(bench);
                 prepared.sanity_check();

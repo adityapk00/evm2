@@ -3,9 +3,8 @@
 use crate::{
     EvmConfig, EvmTypesHost, SpecId,
     constants::{
-        BLOB_BASE_FEE_UPDATE_FRACTION_AMSTERDAM, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN,
-        BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE, MAX_CODE_SIZE, MAX_CODE_SIZE_AMSTERDAM,
-        MAX_INITCODE_SIZE, MAX_INITCODE_SIZE_AMSTERDAM,
+        CALL_DEPTH_LIMIT, MAX_CODE_SIZE, MAX_CODE_SIZE_AMSTERDAM, MAX_INITCODE_SIZE,
+        MAX_INITCODE_SIZE_AMSTERDAM,
     },
     interpreter::{instructions as instr, op},
 };
@@ -18,7 +17,7 @@ mod features;
 pub use features::EvmFeatures;
 
 mod opcode_config;
-pub use opcode_config::OpcodeConfig;
+pub use opcode_config::{OpcodeChange, OpcodeConfig, OpcodeView};
 
 /// Runtime configuration data.
 ///
@@ -46,8 +45,14 @@ pub struct Version {
     pub max_initcode_size: usize,
     /// Maximum blobs allowed in a single blob transaction.
     pub max_blobs_per_tx: usize,
-    /// Blob base fee update fraction.
-    pub blob_base_fee_update_fraction: u64,
+    /// Inspector-visible depth of the transaction root. Defaults to zero.
+    ///
+    /// Nested transaction roots can retain their outer call depth while receiving a fresh
+    /// [`CALL_DEPTH_LIMIT`]-descendant budget. This must leave room in `u16` for that budget
+    /// and the attempted-too-deep message: at most `u16::MAX - CALL_DEPTH_LIMIT - 1` (64510).
+    /// Installing a version with a larger value through
+    /// [`ExecutionConfig::with_version`](crate::ExecutionConfig::with_version) panics.
+    pub initial_call_depth: u16,
 
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     pub _non_exhaustive: (),
@@ -70,6 +75,40 @@ impl Version {
     #[inline]
     pub const fn feature(&self, feature: EvmFeatures) -> bool {
         self.features.contains(feature)
+    }
+
+    /// Returns the transaction gas caps as `(tx_gas_limit_cap, execution_gas_cap)`, where
+    /// `u64::MAX` means uncapped.
+    ///
+    /// - `tx_gas_limit_cap` bounds the transaction gas limit (`tx.gas`).
+    /// - `execution_gas_cap` bounds the execution gas a transaction requires upfront, i.e.
+    ///   `max(intrinsic_gas, floor_gas)`.
+    ///
+    /// Without EIP-8037, [`tx_gas_limit_cap`](Self::tx_gas_limit_cap) (EIP-7825) bounds `tx.gas`
+    /// itself, which also bounds the execution gas. With EIP-8037, `tx.gas` may exceed it because
+    /// the excess funds the state-gas reservoir, so it only bounds the required execution gas.
+    ///
+    /// The Ethereum transaction handlers enforce these caps through
+    /// [`validate_tx_gas_limit_cap`](crate::ethereum::validate_tx_gas_limit_cap) and
+    /// [`validate_execution_gas_limit_cap`](crate::ethereum::validate_execution_gas_limit_cap).
+    /// Stateless validators, such as a transaction pool, can use this to apply the same caps
+    /// without executing the transaction.
+    #[inline]
+    pub const fn tx_gas_caps(&self) -> (u64, u64) {
+        if self.feature(EvmFeatures::EIP8037) {
+            (u64::MAX, self.tx_gas_limit_cap)
+        } else {
+            (self.tx_gas_limit_cap, u64::MAX)
+        }
+    }
+
+    /// Returns the deepest permitted inspector-visible call depth.
+    ///
+    /// [`ExecutionConfig::with_version`](crate::ExecutionConfig::with_version) validates
+    /// [`Self::initial_call_depth`], so this cannot overflow for an installed version.
+    #[inline]
+    pub const fn max_call_depth(&self) -> u16 {
+        self.initial_call_depth + CALL_DEPTH_LIMIT
     }
 }
 
@@ -95,16 +134,6 @@ const fn base_max_blobs_per_tx(spec_id: SpecId) -> usize {
     }
 }
 
-const fn base_blob_base_fee_update_fraction(spec_id: SpecId) -> u64 {
-    if spec_id.enables(SpecId::AMSTERDAM) {
-        BLOB_BASE_FEE_UPDATE_FRACTION_AMSTERDAM
-    } else if spec_id.enables(SpecId::PRAGUE) {
-        BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE
-    } else {
-        BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN
-    }
-}
-
 const DEFAULT_MEMORY_LIMIT: u64 = (1 << 32) - 1;
 const DEFAULT_CHAIN_ID: u64 = 1;
 
@@ -119,7 +148,7 @@ static BASE_VERSIONS: [Version; SpecId::COUNT] = {
             max_code_size: MAX_CODE_SIZE,
             max_initcode_size: MAX_INITCODE_SIZE,
             max_blobs_per_tx: MAX_BLOBS_PER_BLOCK_DENCUN,
-            blob_base_fee_update_fraction: BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN,
+            initial_call_depth: 0,
             _non_exhaustive: (),
         }
     }; SpecId::COUNT];
@@ -135,7 +164,7 @@ static BASE_VERSIONS: [Version; SpecId::COUNT] = {
             max_code_size: base_max_code_size(spec_id),
             max_initcode_size: base_max_initcode_size(spec_id),
             max_blobs_per_tx: base_max_blobs_per_tx(spec_id),
-            blob_base_fee_update_fraction: base_blob_base_fee_update_fraction(spec_id),
+            initial_call_depth: 0,
             _non_exhaustive: (),
         };
         i += 1;
@@ -219,7 +248,7 @@ macro_rules! evm_versions {
             use crate::interpreter::gas::*;
 
             let spec_id = Cfg::BASE_SPEC_ID;
-            let mut v = OpcodeConfig::empty();
+            let mut v = OpcodeConfig::empty(spec_id);
 
             $(
                 if spec_id.enables(SpecId::$spec) {
@@ -270,8 +299,10 @@ mod tests {
         assert!(osaka.feature(EvmFeatures::EIP7623));
         assert!(osaka.feature(EvmFeatures::EIP7702));
         assert!(osaka.feature(EvmFeatures::BASE_FEE_CHECK));
+        assert!(osaka.feature(EvmFeatures::BLOB_BASE_FEE_CHECK));
         assert!(osaka.feature(EvmFeatures::PRIORITY_FEE_CHECK));
         assert!(osaka.feature(EvmFeatures::FEE_CHARGE));
+        assert!(osaka.feature(EvmFeatures::LOG_COLLECTION));
         assert!(!osaka.feature(EvmFeatures::EIP7708));
         assert!(!osaka.feature(EvmFeatures::EIP8246));
         assert!(!osaka.feature(EvmFeatures::EIP8037));
@@ -281,7 +312,6 @@ mod tests {
         assert_eq!(osaka.max_code_size, MAX_CODE_SIZE);
         assert_eq!(osaka.max_initcode_size, MAX_INITCODE_SIZE);
         assert_eq!(osaka.max_blobs_per_tx, MAX_BLOBS_PER_BLOCK_DENCUN);
-        assert_eq!(osaka.blob_base_fee_update_fraction, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
 
         let amsterdam = Version::base(SpecId::AMSTERDAM);
         assert!(amsterdam.feature(EvmFeatures::TX_CHAIN_ID_CHECK));
@@ -294,18 +324,12 @@ mod tests {
         assert_eq!(amsterdam.max_code_size, MAX_CODE_SIZE_AMSTERDAM);
         assert_eq!(amsterdam.max_initcode_size, MAX_INITCODE_SIZE_AMSTERDAM);
         assert_eq!(amsterdam.max_blobs_per_tx, MAX_BLOBS_PER_BLOCK_DENCUN);
-        assert_eq!(
-            amsterdam.blob_base_fee_update_fraction,
-            BLOB_BASE_FEE_UPDATE_FRACTION_AMSTERDAM
-        );
 
         let cancun = Version::base(SpecId::CANCUN);
         assert_eq!(cancun.max_blobs_per_tx, MAX_BLOBS_PER_BLOCK_DENCUN);
-        assert_eq!(cancun.blob_base_fee_update_fraction, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
 
         let prague = Version::base(SpecId::PRAGUE);
         assert_eq!(prague.max_blobs_per_tx, 9);
-        assert_eq!(prague.blob_base_fee_update_fraction, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
     }
 
     #[test]
@@ -355,6 +379,30 @@ mod tests {
         let prague = opcode_config(SpecId::PRAGUE);
         assert_eq!(prague.static_gas(op::EXTCODESIZE), prague.static_gas(op::EXTCODEHASH));
     }
+
+    #[test]
+    fn tx_gas_caps() {
+        let prague = Version::base(SpecId::PRAGUE);
+        assert_eq!(prague.tx_gas_caps(), (u64::MAX, u64::MAX));
+
+        let osaka = Version::base(SpecId::OSAKA);
+        assert_eq!(osaka.tx_gas_caps(), (MAX_TX_GAS_LIMIT_OSAKA, u64::MAX));
+
+        let amsterdam = Version::base(SpecId::AMSTERDAM);
+        assert_eq!(amsterdam.tx_gas_caps(), (u64::MAX, MAX_TX_GAS_LIMIT_OSAKA));
+
+        let mut amsterdam_without_eip8037 = Version::new(SpecId::AMSTERDAM);
+        amsterdam_without_eip8037.features.remove(EvmFeatures::EIP8037);
+        assert_eq!(amsterdam_without_eip8037.tx_gas_caps(), (MAX_TX_GAS_LIMIT_OSAKA, u64::MAX));
+    }
+
+    #[test]
+    #[should_panic(expected = "initial call depth must leave room")]
+    fn execution_config_rejects_unrepresentable_call_budget() {
+        let mut version = Version::new(SpecId::CANCUN);
+        version.initial_call_depth = u16::MAX - CALL_DEPTH_LIMIT;
+        crate::ExecutionConfig::<BaseEvmTypes>::for_spec_and_version(SpecId::CANCUN, version);
+    }
 }
 
 /// EIP-8037 cost per state byte (CPSB) for Glamsterdam.
@@ -369,8 +417,11 @@ evm_versions! {
             BALANCE_TOP_UP,
             BLOCK_GAS_LIMIT_CHECK,
             EIP3607,
+            BASE_FEE_CHECK,
+            BLOB_BASE_FEE_CHECK,
             PRIORITY_FEE_CHECK,
             FEE_CHARGE,
+            LOG_COLLECTION,
         ],
         ops: [
             STOP: ZERO,
@@ -657,7 +708,6 @@ evm_versions! {
         features: [
             EIP3529,
             EIP3541,
-            BASE_FEE_CHECK,
         ],
         ops: [
             BASEFEE: BASE,
@@ -846,9 +896,10 @@ evm_versions! {
             // gas phase per authority.
             TxEip7702PerEmptyAccountCost: EIP8038_EIP7702_PER_AUTH_BASE_REGULAR,
 
-            // EIP-2780: Reduce intrinsic transaction gas. The `to`- and
+            // EIP-2780: Reduce intrinsic transaction gas. The base, `to`- and
             // `value`-based intrinsic charges. ACCOUNT_WRITE / CREATE_ACCESS
             // source from EIP-8038 so a single change propagates everywhere.
+            TxBaseStipend: EIP2780_TX_BASE_COST,
             TxValueCost: EIP2780_TX_VALUE_COST,
             TxCreateAccessCost: EIP8038_CREATE_ACCESS,
         ],

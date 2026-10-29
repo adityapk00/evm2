@@ -1,6 +1,6 @@
 //! Precompile dispatch interface.
 
-use super::{Evm, NonStaticAny};
+use super::{Evm, NonStaticAny, PrewarmSet};
 use crate::{
     EvmTypesHost, PrecompileError,
     interpreter::{GasTracker, Message},
@@ -45,10 +45,18 @@ pub trait PrecompileProvider<T: EvmTypesHost>: NonStaticAny {
         Vec::new()
     }
 
-    /// Returns precompile addresses and identifiers.
-    fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
-        Vec::new()
+    /// Marks every precompile address as warm.
+    ///
+    /// Defaults to warming each of [`Self::addresses`]; providers should override it to avoid the
+    /// allocation, since it runs once per transaction.
+    fn warm_addresses(&self, warm: &mut PrewarmSet) {
+        for address in self.addresses() {
+            warm.warm(&address);
+        }
     }
+
+    /// Returns precompile addresses and identifiers.
+    fn precompile_ids(&self) -> Vec<(Address, PrecompileId)>;
 
     /// Returns whether `address` has a registered precompile.
     fn contains(&self, address: &Address) -> bool;
@@ -60,7 +68,7 @@ pub trait PrecompileProvider<T: EvmTypesHost>: NonStaticAny {
     /// method must not mutate state: it can be evaluated before a frame is run.
     #[inline]
     fn contains_message(&self, message: &Message<T>) -> bool {
-        self.contains(&message.code_address)
+        self.contains(&message.call_target)
     }
 
     /// Relocates installed precompiles, validating all sources before changing the provider.
@@ -70,7 +78,10 @@ pub trait PrecompileProvider<T: EvmTypesHost>: NonStaticAny {
     fn move_precompiles(&mut self, moves: &[(Address, Address)])
     -> Result<(), MovePrecompileError>;
 
-    /// Executes the precompile at `address`, if one is registered.
+    /// Executes the precompile at [`Message::call_target`], if one is registered.
+    ///
+    /// Dispatch uses the original callee even when its stored code is an EIP-7702 delegation.
+    /// Returns `None` when the original callee has no registered precompile.
     ///
     /// Execution uses a shared provider reference so a child call can reenter
     /// dispatch. Execution state belongs in the EVM journal or in scoped interior
@@ -115,6 +126,11 @@ pub struct NoPrecompiles(());
 impl<T: EvmTypesHost> PrecompileProvider<T> for NoPrecompiles {
     #[inline]
     fn addresses(&self) -> Vec<Address> {
+        Vec::new()
+    }
+
+    #[inline]
+    fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
         Vec::new()
     }
 
