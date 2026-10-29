@@ -296,30 +296,50 @@ const MAX_SEGS_BELOW: usize = 64;
 
 /// Memory words at constant offsets whose values are known, sorted by offset and disjoint.
 ///
-/// Only words written by `MSTORE` are tracked, so memory already covers a word that `MLOAD`
-/// folds and the load needs no memory expansion. Every instruction that writes memory clears
-/// the words it may overlap, and joins keep only the words known on every path. The number of
-/// words is not capped: dropping a word to make room for another would make the transfer
-/// non-monotone (a more precise state could forget a word that a less precise one keeps), which
-/// lets the fixpoint reach a block that the committed jump resolutions no longer justify.
+/// Only words written by `MSTORE` or by a constant `CODECOPY` are tracked, so memory already
+/// covers a word that `MLOAD` folds and the load needs no memory expansion. Every instruction
+/// that writes memory clears the words it may overlap, and joins keep only the words known on
+/// every path. The number of words is not capped: dropping a word to make room for another would
+/// make the transfer non-monotone (a more precise state could forget a word that a less precise
+/// one keeps), which lets the fixpoint reach a block that the committed jump resolutions no
+/// longer justify.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct MemWords(SmallVec<[(u32, AbsValue); 4]>);
+struct MemWords {
+    words: SmallVec<[(u32, AbsValue); 4]>,
+    /// Whether no instruction has written memory yet, so every byte not in `words` is zero.
+    pristine: bool,
+}
 
 impl MemWords {
-    /// Applies the memory effect of `opcode` with the given `inputs` (TOS last).
+    /// Returns the state at the start of the code, where memory is empty if the caller passes no
+    /// stack.
+    fn entry(stack_observed: bool) -> Self {
+        Self { words: SmallVec::new(), pristine: !stack_observed }
+    }
+
+    /// Applies the memory effect of `opcode` with the given `inputs` (TOS last), where `code` is
+    /// the code being analyzed.
     ///
     /// Returns the known value loaded by an `MLOAD`.
-    fn transfer(&mut self, opcode: u8, inputs: &[AbsValue]) -> Option<AbsValue> {
+    fn transfer(
+        &mut self,
+        opcode: u8,
+        inputs: &[AbsValue],
+        code: &[u8],
+        interner: &mut U256Interner,
+    ) -> Option<AbsValue> {
         // Offsets and lengths that fit in an inline immediate, and their bounds; larger ones are
         // unknown.
         let imm = |depth: usize| inputs[inputs.len() - 1 - depth].as_const()?.get_inline();
         let bounds = |depth: usize| inputs[inputs.len() - 1 - depth].bounds();
         let len = |depth: usize| bounds(depth).map(|len| len.last);
+        let pristine = std::mem::take(&mut self.pristine);
         match opcode {
             op::MLOAD => {
+                self.pristine = pristine;
                 let offset = imm(0)?;
-                let i = self.0.binary_search_by_key(&offset, |&(o, _)| o).ok()?;
-                return Some(self.0[i].1);
+                let i = self.words.binary_search_by_key(&offset, |&(o, _)| o).ok()?;
+                return Some(self.words[i].1);
             }
             op::MSTORE => {
                 let value = inputs[inputs.len() - 2];
@@ -327,20 +347,57 @@ impl MemWords {
                 if let Some(offset) = imm(0)
                     && value != AbsValue::Top
                 {
-                    let i = self.0.partition_point(|&(o, _)| o < offset);
-                    self.0.insert(i, (offset, value));
+                    let i = self.words.partition_point(|&(o, _)| o < offset);
+                    self.words.insert(i, (offset, value));
                 }
             }
             op::MSTORE8 => self.clobber(bounds(0), Some(1)),
-            op::CALLDATACOPY | op::CODECOPY | op::RETURNDATACOPY | op::MCOPY => {
-                self.clobber(bounds(0), len(2))
+            op::CODECOPY => {
+                let word = self.codecopy_word(pristine, imm(0), imm(1), imm(2), code, interner);
+                self.clobber(bounds(0), len(2));
+                if let Some((offset, value)) = word {
+                    let i = self.words.partition_point(|&(o, _)| o < offset);
+                    self.words.insert(i, (offset, AbsValue::Const(U256Imm::new(value, interner))));
+                }
             }
+            op::CALLDATACOPY | op::RETURNDATACOPY | op::MCOPY => self.clobber(bounds(0), len(2)),
             op::EXTCODECOPY => self.clobber(bounds(1), len(3)),
             op::CALL | op::CALLCODE => self.clobber(bounds(5), len(6)),
             op::DELEGATECALL | op::STATICCALL => self.clobber(bounds(4), len(5)),
-            _ => {}
+            // Instructions that do not write memory keep it empty.
+            _ => self.pristine = pristine,
         }
         None
+    }
+
+    /// Returns the word that a `CODECOPY` of `len` bytes at `src` to `dest` leaves at the end of
+    /// its destination, where memory expansion covers it, if the rest of that word is known: a
+    /// tracked word at the same offset, or zeros when memory is `pristine` with no tracked word.
+    fn codecopy_word(
+        &self,
+        pristine: bool,
+        dest: Option<u32>,
+        src: Option<u32>,
+        len: Option<u32>,
+        code: &[u8],
+        interner: &U256Interner,
+    ) -> Option<(u32, U256)> {
+        let (dest, src, len) = (dest?, src? as usize, len?);
+        let offset = dest.checked_add(len)?.checked_sub(32).filter(|_| (1..=32).contains(&len))?;
+        let len = len as usize;
+        let base = match self.words.binary_search_by_key(&offset, |&(o, _)| o) {
+            Ok(i) => self.words[i].1.as_const()?.get(interner),
+            Err(_) if pristine && self.words.is_empty() => U256::ZERO,
+            Err(_) => return None,
+        };
+        // Bytes past the end of the code are zero.
+        let mut copied = [0; 32];
+        if let Some(bytes) = code.get(src..) {
+            let bytes = &bytes[..len.min(bytes.len())];
+            copied[32 - len..][..bytes.len()].copy_from_slice(bytes);
+        }
+        let mask = U256::MAX >> (256 - 8 * len);
+        Some((offset, base & !mask | U256::from_be_bytes(copied)))
     }
 
     /// Forgets every word that a write of at most `len` bytes at an offset in `offset` may
@@ -351,25 +408,26 @@ impl MemWords {
             (Some(offset), len) => {
                 // Inline immediates are below 2^31, so these sums cannot overflow.
                 let end = len.map_or(u32::MAX, |len| offset.last + len);
-                self.0.retain(|&mut (o, _)| o + 32 <= offset.start || end <= o);
+                self.words.retain(|&mut (o, _)| o + 32 <= offset.start || end <= o);
             }
-            (None, _) => self.0.clear(),
+            (None, _) => self.words.clear(),
         }
     }
 
     /// Keeps the words known in both states, joining their values. Returns `true` if `self`
     /// changed.
     fn join(&mut self, other: &Self, sets: &mut ConstSetInterner) -> bool {
-        let len = self.0.len();
-        let mut changed = false;
-        self.0.retain(|(offset, value)| {
-            let Ok(i) = other.0.binary_search_by_key(offset, |&(o, _)| o) else { return false };
-            let joined = sets.join(*value, other.0[i].1);
+        let len = self.words.len();
+        let mut changed = self.pristine && !other.pristine;
+        self.pristine &= other.pristine;
+        self.words.retain(|(offset, value)| {
+            let Ok(i) = other.words.binary_search_by_key(offset, |&(o, _)| o) else { return false };
+            let joined = sets.join(*value, other.words[i].1);
             changed |= joined != *value;
             *value = joined;
             joined != AbsValue::Top
         });
-        changed || self.0.len() != len
+        changed || self.words.len() != len
     }
 }
 
@@ -1471,8 +1529,9 @@ impl Bytecode<'_> {
         // Entry block starts with an empty stack, or with unknown entries when the caller may
         // pass a stack.
         let no_mem = MemWords::default();
+        let entry_mem = MemWords::entry(self.stack_observed());
         let entry = Block::from_usize(0);
-        parts.join(entry, 0, &[], self.stack_observed(), &[], &no_mem, &mut const_sets, &budget);
+        parts.join(entry, 0, &[], self.stack_observed(), &[], &entry_mem, &mut const_sets, &budget);
 
         // Discovered dynamic-jump target edges per block.
         let mut discovered: IndexVec<Block, SmallVec<[Block; 4]>> =
@@ -1976,7 +2035,7 @@ impl Bytecode<'_> {
         (tracked as u8, truncated || stack.len() > tracked, continued).hash(&mut hasher);
         match mode {
             ContextMode::Full | ContextMode::Folded => {
-                for &(offset, value) in &mem.0 {
+                for &(offset, value) in &mem.words {
                     if let Some(pc) = self.jump_target_pc(value) {
                         (offset, pc).hash(&mut hasher);
                     }
@@ -2191,11 +2250,16 @@ impl Bytecode<'_> {
                     None
                 } else if inst.flags.contains(InstFlags::HOST) {
                     // The host's instruction may write any memory and any stack word.
-                    mem.0.clear();
+                    *mem = MemWords::default();
                     stack.fill(AbsValue::Top);
                     None
                 } else {
-                    mem.transfer(inst.opcode, &stack[stack.len() - inp..])
+                    mem.transfer(
+                        inst.opcode,
+                        &stack[stack.len() - inp..],
+                        &self.code,
+                        &mut self.u256_interner.borrow_mut(),
+                    )
                 };
 
                 // Try constant folding for common arithmetic, respecting the gas budget.
@@ -4385,6 +4449,13 @@ mod tests_edge_cases {
         ];
         for op in ["CALLDATACOPY", "CODECOPY", "RETURNDATACOPY", "MCOPY", "PUSH0 EXTCODECOPY"] {
             for (operands, expected) in cases {
+                // A constant `CODECOPY` ending the word replaces its last byte with the first byte
+                // of the code, the opcode of the first `PUSH`.
+                let expected = if op == "CODECOPY" && operands == "PUSH 1 PUSH0 PUSH 0x5f" {
+                    Some(U256::from(op::PUSH1))
+                } else {
+                    expected
+                };
                 assert_eq!(
                     mload_0x40_after(&format!("{operands} {op}")),
                     expected,
@@ -4900,6 +4971,55 @@ mod tests_edge_cases {
         );
         assert!(!bytecode.has_dynamic_jumps);
         assert_eq!(multi_jump_target_pcs(&bytecode), [0x20, 0x22, 0x24, 0x26]);
+    }
+
+    /// Vyper's dense selector table copies the entry for `selector % n` from the code into the
+    /// last two bytes of the first word of memory, which is all zeros otherwise, and jumps to that
+    /// word.
+    #[test]
+    fn codecopy_jump_table() {
+        let src = |prefix: &str| {
+            format!(
+                "
+                {prefix}
+                PUSH0
+                CALLDATALOAD
+                PUSH1 0xe0
+                SHR                 ; selector
+                PUSH1 0x03
+                SWAP1
+                MOD
+                PUSH1 0x01
+                SHL                 ; 2 * (selector % 3)
+                PUSH %table
+                ADD
+                PUSH1 0x01
+                ADD                 ; skip the PUSH6 opcode
+                PUSH1 0x02
+                SWAP1
+                PUSH1 0x1e
+                CODECOPY            ; memory[0x1e..0x20] = entry
+                PUSH0
+                MLOAD
+                JUMP
+                JUMPDEST            ; 0x1b
+                STOP
+                JUMPDEST            ; 0x1d
+                STOP
+                JUMPDEST            ; 0x1f
+                STOP
+            table:
+                PUSH6 0x001f001d001b
+                "
+            )
+        };
+        let bytecode = analyze_asm(&src(""));
+        assert!(!bytecode.has_dynamic_jumps);
+        assert_eq!(multi_jump_target_pcs(&bytecode), [0x1b, 0x1d, 0x1f]);
+
+        // The word is only known over zeros: after a write to memory the rest of it is unknown.
+        let bytecode = analyze_asm(&src("PUSH0 CALLDATALOAD PUSH1 0x40 MSTORE"));
+        assert!(bytecode.has_dynamic_jumps);
     }
 
     /// Range jumps resolve to at most [`MAX_RANGE_JUMP_TARGETS`] targets in total, since each
