@@ -131,16 +131,15 @@ impl Memory {
             return Err(InstrStop::MemoryLimitOOG);
         }
 
+        // Commit the new size and balance only once the expansion is paid for, so a failed
+        // charge leaves the gas, memory length and word count as they were before the step.
         let cost = gas_params.memory_cost(new_num_words);
-        let cost =
-            unsafe { gas.memory_mut().set_words_num(new_num_words, cost).unwrap_unchecked() };
-
-        // Preserve the balance on failure so step_end sees only charges paid
-        // before the expansion was attempted.
-        let Some(remaining) = gas.remaining().checked_sub(cost) else {
+        let delta = unsafe { cost.checked_sub(gas.memory().expansion_cost).unwrap_unchecked() };
+        let Some(remaining) = gas.remaining().checked_sub(delta) else {
             return Err(InstrStop::MemoryOOG);
         };
         gas.set_remaining(remaining);
+        gas.memory_mut().set_words_num(new_num_words, cost);
         self.resize_to(new_size);
         Ok(())
     }
