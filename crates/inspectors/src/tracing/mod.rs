@@ -400,7 +400,7 @@ impl TracingInspector {
         let steps = self.reusable_step_vecs.pop().unwrap_or_default();
 
         // the currently active call is the parent of the new call
-        let parent = self.trace_stack.last().map_or(0, |entry| entry.trace_idx);
+        let parent = self.trace_stack.last().map(|entry| entry.trace_idx);
 
         let trace_idx = self.traces.push_trace(
             parent,
@@ -652,10 +652,13 @@ impl TracingInspector {
         }
 
         // The gas cost is the difference between the recorded gas remaining at the start of the
-        // step the remaining gas here, at the end of the step.
-        step.gas_cost = interp
-            .failed_charge()
-            .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        // step and the remaining gas here, at the end of the step. An out-of-gas step consumes
+        // the whole remainder, except the reentrancy sentry, which halts before any charge.
+        step.gas_cost = if interp.result() == Err(InstrStop::ReentrancySentryOOG) {
+            0
+        } else {
+            step.gas_remaining.saturating_sub(interp.gas().remaining())
+        };
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
@@ -801,7 +804,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             .then(|| self.is_precompile_call(interp.host(), &to, &value));
 
         let input = if self.config.record_inputs
-            && (message.depth == 0 || self.budget.reserve(message.input.len()))
+            && (self.trace_stack.is_empty() || self.budget.reserve(message.input.len()))
         {
             message.input.to_bytes(interp.memory())
         } else {
@@ -843,7 +846,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
         self.features = interp.version().features;
 
         let input = if self.config.record_inputs
-            && (message.depth == 0 || self.budget.reserve(message.input.len()))
+            && (self.trace_stack.is_empty() || self.budget.reserve(message.input.len()))
         {
             message.input.to_bytes(interp.memory())
         } else {
@@ -865,7 +868,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
 
     fn create_end(
         &mut self,
-        _interp: &mut Interpreter<'_, '_, T>,
+        interp: &mut Interpreter<'_, '_, T>,
         message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
@@ -873,7 +876,9 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
         self.fill_trace_on_call_end(result);
         // A nested CREATE whose creator nonce cannot be incremented returns successfully but
         // without an address, leaving its gas unspent.
-        if message.depth > 0 && result.created_address.is_none() && result.stop == InstrStop::Return
+        if message.depth > interp.version().initial_call_depth
+            && result.created_address.is_none()
+            && result.stop == InstrStop::Return
         {
             let trace = &mut self.traces.arena[trace_idx].trace;
             trace.status = Some(InstrStop::NonceOverflow);
