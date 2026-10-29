@@ -676,10 +676,18 @@ mod tests {
         #[values(0x00, 0xfd, 0xfe)] opcode: u8,
     ) {
         let (mut evm, tx) = setup::<IntrinsicHooks>(true, opcode);
-        let intrinsic =
-            intrinsic_gas(evm.version(), CALLER, TARGET.into(), &Bytes::new(), 0, 0, U256::ZERO)
-                + u64::from(evm.version().gas_params[GasId::TxEip7702PerEmptyAccountCost])
-                + 777;
+        let intrinsic = intrinsic_and_floor_gas(
+            evm.version(),
+            CALLER,
+            TARGET.into(),
+            &Bytes::new(),
+            0,
+            0,
+            U256::ZERO,
+        )
+        .0 + u64::from(
+            evm.version().gas_params[GasId::TxEip7702PerEmptyAccountCost],
+        ) + 777;
         let result = evm.transact(&tx).unwrap().commit();
         assert_eq!(result.status, opcode == 0x00);
         assert_eq!(result.stop.is_revert(), opcode == 0xfd);
@@ -704,8 +712,16 @@ mod tests {
             AccountInfo::default().with_code(Bytecode::new_eip7702(TARGET)),
         );
         let intrinsic =
-            intrinsic_gas(evm.version(), CALLER, TARGET.into(), &Bytes::new(), 0, 0, U256::ZERO)
-                + u64::from(evm.version().gas_params[GasId::TxEip7702PerEmptyAccountCost]);
+            intrinsic_and_floor_gas(
+                evm.version(),
+                CALLER,
+                TARGET.into(),
+                &Bytes::new(),
+                0,
+                0,
+                U256::ZERO,
+            )
+            .0 + u64::from(evm.version().gas_params[GasId::TxEip7702PerEmptyAccountCost]);
         let result = evm.transact(&tx).unwrap().commit();
         assert!(result.status);
         assert_eq!(result.state_gas_spent, 0);
